@@ -1,0 +1,69 @@
+syntax = "proto3";
+
+package KAD;
+
+message IpV6 {
+    uint64 hi = 1;
+    uint64 lo = 2;
+}
+
+message Node {
+    oneof ip {
+        uint32 v4 = 1;
+        IpV6 v6 = 2;
+    }
+    uint32 port = 3;
+    bytes key = 4;
+}
+
+message Storage {
+    bytes key = 1;
+    bytes value = 2;
+    uint32 ttl = 3;
+}
+
+message Ping {
+    uint32 rand_val = 1;
+}
+
+message Pong {
+    uint32 rand_val = 1;
+}
+
+message Store {
+    uint32 rand_val = 1;
+    bytes keyword = 2;
+    Storage storage = 3;
+}
+
+message FindNode {
+    uint32 rand_val = 1;
+    bytes key = 2;
+}
+
+message FindNodeResult {
+    uint32 rand_val = 1;
+    repeated Node nodes = 2;
+}
+
+message FindValue {
+    uint32 rand_val = 1;
+    bytes keyword = 2;
+}
+
+message FindValueResult {
+    uint32 rand_val = 1;
+
+    oneof result {
+        Nodes nodes = 2;
+        Values values = 3;
+    }
+}
+
+message Nodes {
+    repeated Node nodes = 1;
+}
+
+message Values {
+    repeated Storage values = 1;
+}

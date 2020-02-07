@@ -1,0 +1,25 @@
+[package]
+name = "ya-net-kad"
+version = "0.1.0"
+authors = ["Golem Factory <contact@golem.network>"]
+edition = "2018"
+
+[dependencies]
+actix = "0.9"
+chrono = "0.4.10"
+generic-array = { version = "0.13.2", features = ["more_lengths", "serde"] }
+futures = { version = "0.3.4", features = ["alloc"] }
+hex = "0.4.2"
+itertools = "0.8.2"
+lazy_static = "1.4.0"
+log = "0.4.8"
+prost = "0.6.1"
+rand = "0.6"
+serde = { version = "1.0.104", features = ["derive"] }
+serde_bytes = "0.11.3"
+thiserror = "1.0.11"
+num-bigint = { version = "0.2", features = ["rand", "serde"] }
+num-traits = "0.2"
+
+[build-dependencies]
+prost-build = "0.6.1"
