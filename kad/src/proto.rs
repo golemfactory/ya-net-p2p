@@ -1,59 +1,53 @@
-use crate::message;
-use crate::model::*;
 use crate::table::Table;
-use crate::Error;
-use crate::{KadAction, Key, KeyGen, KeyOps, Node};
+use crate::{message, Error, LocalAdd, LocalStore};
+use crate::{KadMessage, KadMessageIn, Key, KeyLen, Node, Result};
 use actix::prelude::*;
 use chrono::Utc;
 use futures::channel::mpsc;
-use futures::SinkExt;
+use futures::{FutureExt, SinkExt};
 use generic_array::ArrayLength;
+use rand::RngCore;
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::sync::Arc;
 
+const BUCKET_SIZE: usize = 20;
 const MAX_KEY_SZ: usize = 33;
 const MAX_VALUE_SZ: usize = 65536;
 const MAX_VALUES_TO_SEND: usize = 100;
 const MAX_TTL: u32 = 604800;
+const MAX_REQ_TTL: i64 = 300;
 
-pub struct Kad<KeySz>
-where
-    KeySz: ArrayLength<u8>,
-{
-    table: Table<KeySz>,
-    storage: HashMap<Vec<u8>, Vec<(message::Storage, i64)>>,
-    tx: mpsc::Sender<KadAction<KeySz>>,
+pub struct Kad<N: KeyLen> {
+    table: Table<N>,
+    storage: HashMap<Vec<u8>, (message::Value, i64)>,
+    tx: mpsc::Sender<KadMessage>,
 }
 
-impl<KeySz> Kad<KeySz>
-where
-    KeySz: ArrayLength<u8>,
-{
-    pub fn create(me: Arc<Node<KeySz>>, size: usize) -> (Self, mpsc::Receiver<KadAction<KeySz>>) {
-        let (tx, rx) = mpsc::channel(64);
-        (
-            Self {
-                table: Table::new(me, size),
-                storage: HashMap::new(),
-                tx,
-            },
-            rx,
-        )
+impl<N: KeyLen> Kad<N> {
+    pub fn new(me: Arc<Node<N>>, tx: mpsc::Sender<KadMessage>) -> Self {
+        Self {
+            table: Table::new(me, BUCKET_SIZE),
+            storage: HashMap::new(),
+            tx,
+        }
     }
 
-    pub fn keys_to_refresh(&self) -> Vec<Key<KeySz>> {
+    pub fn keys_to_refresh(&self) -> Vec<Key<N>> {
         self.table
             .stale_buckets()
             .into_iter()
-            .map(|b| Key::<KeySz>::random_within(&b.range))
+            .map(|b| Key::<N>::random(&b.range))
             .collect()
     }
 
-    fn values_to_transfer(&self, _: &Node<KeySz>) -> Result<Vec<message::Storage>, Error> {
-        Ok(Vec::new())
+    fn values_to_transfer(&self, _: &Node<N>) -> Vec<message::Value> {
+        Vec::new()
     }
+}
 
-    fn find_nodes(&self, key: &Key<KeySz>, excluded: Option<&Key<KeySz>>) -> Vec<Node<KeySz>> {
+impl<N: KeyLen> Kad<N> {
+    fn find_node(&self, key: &Key<N>, excluded: Option<&Key<N>>) -> Vec<Node<N>> {
         let mut nodes = self.table.neighbors(&key, excluded);
         if key == &self.table.me.key {
             nodes.push((*self.table.me).clone());
@@ -61,19 +55,17 @@ where
         nodes
     }
 
-    fn collect_values(&mut self, keyword: &Vec<u8>, max: Option<usize>) -> Vec<message::Storage> {
-        match self.storage.get_mut(keyword) {
-            Some(vec) => {
-                let now = Utc::now().timestamp();
-                vec.retain(|(storage, created_at)| storage.ttl as i64 + *created_at > now);
+    fn find_value(&mut self, key: &Vec<u8>) -> Option<message::Value> {
+        let now = Utc::now().timestamp();
+        self.storage
+            .retain(|_, (value, created_at)| value.ttl as i64 + *created_at > now);
 
-                let iter = vec.iter().map(|(s, _)| s.clone());
-                match max {
-                    Some(max) => iter.take(max).collect(),
-                    None => iter.collect(),
-                }
-            }
-            None => Vec::new(),
+        match self.storage.get(key) {
+            Some((value, created_at)) => Some(message::Value {
+                value: value.value.clone(),
+                ttl: value.ttl - (now - created_at) as u32,
+            }),
+            None => None,
         }
     }
 }
@@ -131,231 +123,201 @@ where
 //         if len(inv) > 0:
 //             self.callInv(node, inv[:100]).addCallback(send_values)
 
-macro_rules! actor_response {
-    ($expr:expr) => {
-        match $expr {
-            Ok(value) => value,
-            Err(error) => return actix::ActorResponse::reply(Err(error)),
-        }
-    };
-}
-
-impl<KeySz> Actor for Kad<KeySz>
+impl<N: KeyLen> Actor for Kad<N>
 where
-    KeySz: ArrayLength<u8> + Unpin + 'static,
-    <KeySz as ArrayLength<u8>>::ArrayType: Unpin,
+    N: KeyLen + Unpin + 'static,
+    <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     type Context = Context<Self>;
 }
 
-impl<KeySz> Handler<Ping<KeySz>> for Kad<KeySz>
+impl<N: KeyLen> Handler<KadMessageIn<N>> for Kad<N>
 where
-    KeySz: ArrayLength<u8> + Unpin + 'static,
-    <KeySz as ArrayLength<u8>>::ArrayType: Unpin,
-{
-    type Result = ActorResponse<Self, message::Pong, Error>;
-
-    fn handle(&mut self, msg: Ping<KeySz>, ctx: &mut Context<Self>) -> Self::Result {
-        let address = ctx.address();
-
-        ActorResponse::r#async(
-            async move {
-                address.send(LocalAdd(msg.sender, msg.new_conn)).await??;
-
-                Ok(message::Pong {
-                    rand_val: msg.inner.rand_val,
-                })
-            }
-            .into_actor(self),
-        )
-    }
-}
-
-impl<KeySz> Handler<Pong<KeySz>> for Kad<KeySz>
-where
-    KeySz: ArrayLength<u8> + Unpin + 'static,
-    <KeySz as ArrayLength<u8>>::ArrayType: Unpin,
+    N: KeyLen + Unpin + 'static,
+    <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     type Result = ActorResponse<Self, (), Error>;
 
-    fn handle(&mut self, msg: Pong<KeySz>, ctx: &mut Context<Self>) -> Self::Result {
+    fn handle(&mut self, msg: KadMessageIn<N>, ctx: &mut Context<Self>) -> Self::Result {
         let address = ctx.address();
+        let mut tx = self.tx.clone();
 
-        ActorResponse::r#async(
-            async move {
-                address.send(LocalAdd(msg.sender, msg.new_conn)).await??;
+        let fut = match msg.inner.clone() {
+            KadMessage::FindNode(m) => self.handle_find_node(m, &msg.sender.key).boxed_local(),
+            KadMessage::FindNodeResult(m) => self.handle_find_node_result().boxed_local(),
+            KadMessage::FindValue(m) => self.handle_find_value(m, &msg.sender.key).boxed_local(),
+            KadMessage::FindValueResult(m) => self.handle_find_value_result().boxed_local(),
+            KadMessage::Store(m) => self.handle_store(m, address.clone()).boxed_local(),
+            KadMessage::Ping(m) => self.handle_ping(m).boxed_local(),
+            _ => async move { Ok(None) }.boxed_local(),
+        };
 
-                Ok(())
+        let fut = async move {
+            address.send(LocalAdd(msg.sender, msg.new_conn)).await??;
+            if let Some(reply) = fut.await? {
+                tx.send(reply).await?;
             }
-            .into_actor(self),
-        )
+            Ok(())
+        };
+
+        ActorResponse::r#async(fut.into_actor(self))
     }
 }
 
-impl<KeySz> Handler<Store<KeySz>> for Kad<KeySz>
+type HandlerResult = Result<Option<KadMessage>>;
+
+impl<N> Kad<N>
 where
-    KeySz: ArrayLength<u8> + Unpin + 'static,
-    <KeySz as ArrayLength<u8>>::ArrayType: Unpin,
+    N: KeyLen + Unpin + 'static,
+    <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
-    type Result = ActorResponse<Self, (), Error>;
-
-    fn handle(&mut self, msg: Store<KeySz>, ctx: &mut Context<Self>) -> Self::Result {
-        let address = ctx.address();
-
-        ActorResponse::r#async(
-            async move {
-                address.send(LocalAdd(msg.sender, msg.new_conn)).await??;
-
-                let msg = msg.inner;
-                let storage = msg
-                    .storage
-                    .ok_or(Error::InvalidMessage("storage missing".to_owned()))?;
-
-                if msg.keyword.len() > KeySz::to_usize() {
-                    return Err(Error::InvalidProperty("keyword".to_owned()));
-                }
-
-                if storage.key.len() > MAX_KEY_SZ
-                    || storage.value.len() > MAX_VALUE_SZ
-                    || storage.ttl > MAX_TTL
-                {
-                    return Err(Error::InvalidProperty("storage".to_owned()));
-                }
-
-                address.send(LocalStore(msg.keyword, storage)).await??;
-                Ok(())
-            }
-            .into_actor(self),
-        )
-    }
-}
-
-impl<KeySz> Handler<FindNode<KeySz>> for Kad<KeySz>
-where
-    KeySz: ArrayLength<u8> + Unpin + 'static,
-    <KeySz as ArrayLength<u8>>::ArrayType: Unpin,
-{
-    type Result = ActorResponse<Self, message::FindNodeResult, Error>;
-
-    fn handle(&mut self, msg: FindNode<KeySz>, ctx: &mut Context<Self>) -> Self::Result {
-        let (sender, new_conn, msg) = (msg.sender, msg.new_conn, msg.inner);
-        let rand_val = msg.rand_val;
-        let address = ctx.address();
-
-        if msg.key.len() > KeySz::to_usize() {
-            return ActorResponse::reply(Err(Error::InvalidKeyLength(msg.key.len())));
+    #[inline]
+    fn handle_ping(&mut self, msg: message::Ping) -> impl Future<Output = HandlerResult> {
+        async move {
+            Ok(Some(KadMessage::Pong(message::Pong {
+                rand_val: msg.rand_val,
+            })))
         }
-
-        let key = actor_response!(Key::<KeySz>::try_from_vec(msg.key));
-        let nodes = self.find_nodes(&key, Some(&sender.key));
-
-        ActorResponse::r#async(
-            async move {
-                address.send(LocalAdd(sender, new_conn)).await??;
-
-                Ok(message::FindNodeResult {
-                    rand_val,
-                    nodes: nodes.into_iter().map(Node::into).collect(),
-                })
-            }
-            .into_actor(self),
-        )
     }
-}
 
-impl<KeySz> Handler<FindValue<KeySz>> for Kad<KeySz>
-where
-    KeySz: ArrayLength<u8> + Unpin + 'static,
-    <KeySz as ArrayLength<u8>>::ArrayType: Unpin,
-{
-    type Result = ActorResponse<Self, message::FindValueResult, Error>;
+    #[inline]
+    fn handle_store(
+        &mut self,
+        msg: message::Store,
+        address: Addr<Self>,
+    ) -> impl Future<Output = HandlerResult> {
+        async move {
+            let value = msg.value.ok_or(Error::message("Store: missing 'value'"))?;
+            address.send(LocalStore(msg.key, value)).await??;
+            Ok(None)
+        }
+    }
 
-    fn handle(&mut self, msg: FindValue<KeySz>, ctx: &mut Context<Self>) -> Self::Result {
-        let (sender, new_conn, msg) = (msg.sender, msg.new_conn, msg.inner);
-        let address = ctx.address();
+    #[inline]
+    fn handle_find_node(
+        &mut self,
+        msg: message::FindNode,
+        exclude: &Key<N>,
+    ) -> impl Future<Output = HandlerResult> {
+        let rand_val = msg.rand_val;
+        let nodes = match Key::<N>::try_from(msg.key) {
+            Ok(key) => Ok(self.find_node(&key, Some(exclude))),
+            Err(e) => Err(e),
+        };
 
-        let result = match self.storage.contains_key(&msg.keyword) {
-            true => {
-                let values = self.collect_values(&msg.keyword, None);
+        async move {
+            Ok(Some(KadMessage::FindNodeResult(message::FindNodeResult {
+                rand_val,
+                nodes: nodes?.into_iter().map(Node::into).collect(),
+            })))
+        }
+    }
 
-                message::FindValueResult {
-                    rand_val: msg.rand_val,
-                    result: Some(message::find_value_result::Result::Values(
-                        message::Values { values },
-                    )),
+    #[inline]
+    fn handle_find_node_result(&mut self) -> impl Future<Output = HandlerResult> {
+        async move { HandlerResult::Ok(None) }
+    }
+
+    #[inline]
+    fn handle_find_value(
+        &mut self,
+        msg: message::FindValue,
+        exclude: &Key<N>,
+    ) -> impl Future<Output = HandlerResult> {
+        use message::find_value_result::Result as Response;
+
+        let reply = if let Some(value) = self.find_value(&msg.key) {
+            Ok(message::FindValueResult {
+                rand_val: msg.rand_val,
+                result: Some(Response::Value(value)),
+            })
+        } else {
+            match Key::<N>::try_from(msg.key) {
+                Ok(key) => {
+                    let nodes = self.find_node(&key, Some(exclude));
+                    Ok(message::FindValueResult {
+                        rand_val: msg.rand_val,
+                        result: Some(Response::Nodes(message::Nodes {
+                            nodes: nodes.into_iter().map(Node::into).collect(),
+                        })),
+                    })
                 }
-            }
-            false => {
-                let key = actor_response!(Key::<KeySz>::try_from_vec(msg.keyword));
-                let nodes = self.find_nodes(&key, Some(&sender.key));
-
-                message::FindValueResult {
-                    rand_val: msg.rand_val,
-                    result: Some(message::find_value_result::Result::Nodes(message::Nodes {
-                        nodes: nodes.into_iter().map(Node::into).collect(),
-                    })),
-                }
+                Err(e) => Err(e),
             }
         };
 
-        ActorResponse::r#async(
-            async move {
-                address.send(LocalAdd(sender, new_conn)).await??;
-                Ok(result)
-            }
-            .into_actor(self),
-        )
+        async move { Ok(Some(KadMessage::FindValueResult(reply?))) }
+    }
+
+    #[inline]
+    fn handle_find_value_result(&mut self) -> impl Future<Output = HandlerResult> {
+        async move { Ok(None) }
     }
 }
 
-impl<KeySz> Handler<LocalAdd<KeySz>> for Kad<KeySz>
+impl<N> Handler<LocalAdd<N>> for Kad<N>
 where
-    KeySz: ArrayLength<u8> + Unpin + 'static,
-    <KeySz as ArrayLength<u8>>::ArrayType: Unpin,
+    N: KeyLen + Unpin + 'static,
+    <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     type Result = ActorResponse<Self, (), Error>;
 
-    fn handle(&mut self, msg: LocalAdd<KeySz>, _: &mut Context<Self>) -> Self::Result {
+    fn handle(&mut self, msg: LocalAdd<N>, _: &mut Context<Self>) -> Self::Result {
         let node = msg.0;
         let new_conn = msg.1;
         let mut tx = self.tx.clone();
 
         let action = if !self.table.add(&node) {
-            Some(KadAction::Ping(node.clone()))
+            Some(KadMessage::Ping(message::Ping {
+                rand_val: rand::thread_rng().next_u32(),
+            }))
         } else if new_conn {
-            let values = actor_response!(self.values_to_transfer(&node));
-            match values.len() {
-                0 => None,
-                _ => Some(KadAction::TransferValues(node.clone(), values)),
-            }
+            let values = self.values_to_transfer(&node);
+            // match values.len() {
+            //     0 => None,
+            //     _ => Some(KadMessage::Store(node.clone(), values)),
+            // }
+            None
         } else {
             None
         };
 
-        ActorResponse::r#async(
-            async move {
-                if let Some(a) = action {
-                    if let Err(e) = tx.send(a).await {
-                        log::warn!("Unable to add {:?}: {:?}", node, e);
-                    }
-                }
-                Ok(())
+        let fut = async move {
+            if let Some(a) = action {
+                tx.send(a).await?;
             }
-            .into_actor(self),
-        )
+            Ok(())
+        };
+
+        ActorResponse::r#async(fut.into_actor(self))
     }
 }
 
-impl<KeySz> Handler<LocalStore> for Kad<KeySz>
+impl<N> Handler<LocalStore> for Kad<N>
 where
-    KeySz: ArrayLength<u8> + Unpin + 'static,
-    <KeySz as ArrayLength<u8>>::ArrayType: Unpin,
+    N: KeyLen + Unpin + 'static,
+    <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     type Result = <LocalStore as Message>::Result;
 
     fn handle(&mut self, msg: LocalStore, _: &mut Context<Self>) -> Self::Result {
-        let vec = self.storage.entry(msg.0).or_insert(Vec::new());
-        vec.push((msg.1, Utc::now().timestamp()));
+        if msg.0.len() > MAX_KEY_SZ {
+            return Err(Error::property(
+                "Store",
+                format!("key size > {}", MAX_KEY_SZ),
+            ));
+        }
+        if msg.1.value.len() > MAX_VALUE_SZ {
+            return Err(Error::property(
+                "Store",
+                format!("value size > {}", MAX_VALUE_SZ),
+            ));
+        }
+        if msg.1.ttl > MAX_TTL {
+            return Err(Error::property("Store", format!("ttl > {}", MAX_TTL)));
+        }
+
+        self.storage.insert(msg.0, (msg.1, Utc::now().timestamp()));
         Ok(())
     }
 }

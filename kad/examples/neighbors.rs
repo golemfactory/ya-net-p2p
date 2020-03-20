@@ -1,4 +1,3 @@
-use generic_array::sequence::GenericSequence;
 use generic_array::typenum::U512;
 use itertools::Itertools;
 use num_bigint::BigUint;
@@ -65,8 +64,8 @@ fn dbg_nodes(me: &Node, first: &Vec<Node>, second: &Vec<Node>) {
         .sorted_by_key(|p| me.distance(&p))
         .zip(second.iter().sorted_by_key(|p| me.distance(&p)))
         .for_each(|(n1, n2)| {
-            let d1 = BigUint::from_bytes_be(&me.distance(&n1)).to_string();
-            let d2 = BigUint::from_bytes_be(&me.distance(&n2)).to_string();
+            let d1 = BigUint::from_bytes_be(&me.distance(&n1).as_ref()).to_string();
+            let d2 = BigUint::from_bytes_be(&me.distance(&n2).as_ref()).to_string();
             println!(
                 "exp: {:?}\nkad: {:?}\n\nDistance\nexp: {}..{} (len {})\nkad: {}..{} (len {})\n\n\n",
                 n1,

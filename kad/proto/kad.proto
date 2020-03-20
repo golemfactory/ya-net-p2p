@@ -16,12 +16,6 @@ message Node {
     bytes key = 4;
 }
 
-message Storage {
-    bytes key = 1;
-    bytes value = 2;
-    uint32 ttl = 3;
-}
-
 message Ping {
     uint32 rand_val = 1;
 }
@@ -32,8 +26,8 @@ message Pong {
 
 message Store {
     uint32 rand_val = 1;
-    bytes keyword = 2;
-    Storage storage = 3;
+    bytes key = 2;
+    Value value = 3;
 }
 
 message FindNode {
@@ -48,7 +42,7 @@ message FindNodeResult {
 
 message FindValue {
     uint32 rand_val = 1;
-    bytes keyword = 2;
+    bytes key = 2;
 }
 
 message FindValueResult {
@@ -56,7 +50,7 @@ message FindValueResult {
 
     oneof result {
         Nodes nodes = 2;
-        Values values = 3;
+        Value value = 3;
     }
 }
 
@@ -64,6 +58,7 @@ message Nodes {
     repeated Node nodes = 1;
 }
 
-message Values {
-    repeated Storage values = 1;
+message Value {
+    bytes value = 1;
+    uint32 ttl = 2;
 }

@@ -1,45 +1,21 @@
-use crate::{message, Error, Key, KeyOps};
-use generic_array::ArrayLength;
-use serde::{Deserialize, Serialize};
+use crate::{message, Error, Key, KeyLen, Result};
 use std::convert::TryFrom;
-use std::iter::FromIterator;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
-#[derive(Hash, Eq, Deserialize, Serialize)]
-pub struct Node<KeySz>
-where
-    KeySz: ArrayLength<u8>,
-{
-    pub key: Key<KeySz>,
+#[derive(Clone, Eq, PartialEq, Hash)]
+pub struct Node<N: KeyLen> {
+    pub key: Key<N>,
     pub address: SocketAddr,
 }
 
-impl<KeySz> Node<KeySz>
-where
-    KeySz: ArrayLength<u8>,
-{
+impl<N: KeyLen> Node<N> {
     #[inline(always)]
-    pub fn distance(&self, other: &Self) -> Key<KeySz> {
+    pub fn distance(&self, other: &Self) -> Key<N> {
         self.key.distance(&other.key)
     }
 }
 
-impl<KeySz> Clone for Node<KeySz>
-where
-    KeySz: ArrayLength<u8>,
-{
-    fn clone(&self) -> Self {
-        Node {
-            key: self.key.clone(),
-            address: self.address.clone(),
-        }
-    }
-}
-
-impl<KeySz> std::fmt::Debug for Node<KeySz>
-where
-    KeySz: ArrayLength<u8>,
-{
+impl<N: KeyLen> std::fmt::Debug for Node<N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!(
             "Node {{ key: {}, address: {:?} }}",
@@ -49,28 +25,16 @@ where
     }
 }
 
-impl<KeySz> PartialEq for Node<KeySz>
-where
-    KeySz: ArrayLength<u8>,
-{
-    fn eq(&self, other: &Self) -> bool {
-        self.key == other.key && self.address == other.address
-    }
-}
-
-impl<KeySz> TryFrom<message::Node> for Node<KeySz>
-where
-    KeySz: ArrayLength<u8>,
-{
+impl<N: KeyLen> TryFrom<message::Node> for Node<N> {
     type Error = Error;
 
-    fn try_from(node: message::Node) -> Result<Self, Self::Error> {
-        if node.key.len() > KeySz::to_usize() {
+    fn try_from(node: message::Node) -> Result<Self> {
+        if node.key.len() > N::to_usize() {
             return Err(Error::InvalidKeyLength(node.key.len()));
         }
 
         Ok(Node {
-            key: Key::<KeySz>::try_from_vec(node.key)?,
+            key: Key::<N>::try_from(node.key)?,
             address: match node.ip {
                 Some(node_ip) => match node_ip {
                     message::node::Ip::V4(ip) => {
@@ -83,17 +47,14 @@ where
                         SocketAddr::from(SocketAddrV6::new(ip.into(), node.port as u16, 0, 0))
                     }
                 },
-                None => return Err(Error::InvalidProperty("ip missing".to_owned())),
+                None => return Err(Error::property("Node", "ip == None")),
             },
         })
     }
 }
 
-impl<KeySz> From<Node<KeySz>> for message::Node
-where
-    KeySz: ArrayLength<u8>,
-{
-    fn from(node: Node<KeySz>) -> Self {
+impl<N: KeyLen> From<Node<N>> for message::Node {
+    fn from(node: Node<N>) -> Self {
         message::Node {
             ip: match node.address.ip() {
                 IpAddr::V4(v4) => {
@@ -108,7 +69,7 @@ where
                 }
             },
             port: node.address.port() as u32,
-            key: node.key.to_vec(),
+            key: node.key.as_ref().to_vec(),
         }
     }
 }
