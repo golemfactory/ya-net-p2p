@@ -13,8 +13,8 @@ lazy_static::lazy_static! {
     static ref BIG_UINT_TWO: BigUint = 2_u32.to_biguint().unwrap();
 }
 
-pub trait KeyLen: ArrayLength<u8> + Clone + Ord + Hash {}
-impl<L> KeyLen for L where L: ArrayLength<u8> + Clone + Ord + Hash {}
+pub trait KeyLen: ArrayLength<u8> + Unpin + Clone + Ord + Hash {}
+impl<L> KeyLen for L where L: ArrayLength<u8> + Unpin + Clone + Ord + Hash {}
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Key<N: KeyLen> {

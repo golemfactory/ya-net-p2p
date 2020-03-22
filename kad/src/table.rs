@@ -4,22 +4,23 @@ use chrono::{DateTime, Duration, Utc};
 use itertools::Itertools;
 use num_bigint::{BigUint, ToBigUint};
 use std::ops::Range;
-use std::sync::Arc;
+use std::rc::Rc;
 
 const BUCKET_REFRESH_INTERVAL: i64 = 3600;
+pub const K: usize = 20;
 
 pub struct Table<N: KeyLen> {
-    pub me: Arc<Node<N>>,
+    pub me: Rc<Node<N>>,
     buckets: Vec<Bucket<N>>,
-    size: usize,
+    pub k: usize,
 }
 
 impl<N: KeyLen> Table<N> {
-    pub fn new(me: Arc<Node<N>>, size: usize) -> Self {
+    pub fn new(me: Rc<Node<N>>, k: usize) -> Self {
         Table {
             me,
-            buckets: vec![Bucket::new(Key::<N>::range(), size)],
-            size,
+            buckets: vec![Bucket::new(Key::<N>::range(), k)],
+            k,
         }
     }
 
@@ -57,11 +58,17 @@ impl<N: KeyLen> Table<N> {
         self.buckets.iter().filter(|b| b.stale()).collect()
     }
 
-    pub fn neighbors(&self, key: &Key<N>, excluded: Option<&Key<N>>) -> Vec<Node<N>> {
+    pub fn neighbors(
+        &self,
+        key: &Key<N>,
+        excluded: Option<&Key<N>>,
+        max: Option<usize>,
+    ) -> Vec<Node<N>> {
+        let max = max.unwrap_or(self.k);
         TableIter::new(&self.buckets, self.bucket_index(key))
             .filter(|n| excluded.map(|e| &n.key != e).unwrap_or(true))
             .cloned()
-            .take(self.size)
+            .take(max)
             .sorted_by_key(|e| self.me.distance(&e))
             .collect()
     }
@@ -148,21 +155,21 @@ pub struct Bucket<N: KeyLen> {
     queue: Vec<Node<N>>,
     updated: DateTime<Utc>,
     pub range: Range<BigUint>,
-    pub size: usize,
+    pub k: usize,
 }
 
 impl<N: KeyLen> Bucket<N> {
-    fn new(range: Range<BigUint>, size: usize) -> Self {
-        Self::with_inner(Vec::with_capacity(size), range, size)
+    fn new(range: Range<BigUint>, k: usize) -> Self {
+        Self::with_inner(Vec::with_capacity(k), range, k)
     }
 
-    fn with_inner(inner: Vec<Node<N>>, range: Range<BigUint>, size: usize) -> Self {
+    fn with_inner(inner: Vec<Node<N>>, range: Range<BigUint>, k: usize) -> Self {
         Bucket {
             inner,
             queue: Vec::new(),
             updated: Utc::now(),
             range,
-            size,
+            k,
         }
     }
 
@@ -173,7 +180,7 @@ impl<N: KeyLen> Bucket<N> {
             self.remove(&node);
         }
 
-        let push = self.inner.len() < self.size;
+        let push = self.inner.len() < self.k;
         if push {
             self.inner.push(node);
         // If the bucket is full, keep track of node in a replacement list,
@@ -208,8 +215,8 @@ impl<N: KeyLen> Bucket<N> {
             .partition(|n| n.key.as_ref() < start_bytes.as_slice());
 
         (
-            Bucket::with_inner(f, rf, self.size),
-            Bucket::with_inner(s, rs, self.size),
+            Bucket::with_inner(f, rf, self.k),
+            Bucket::with_inner(s, rs, self.k),
         )
     }
 
@@ -222,11 +229,6 @@ impl<N: KeyLen> Bucket<N> {
     #[inline(always)]
     fn contains(&self, node: &Node<N>) -> bool {
         self.inner.contains(node)
-    }
-
-    #[inline(always)]
-    fn head(&self) -> Option<&Node<N>> {
-        self.inner.last()
     }
 
     fn depth(&self) -> usize {

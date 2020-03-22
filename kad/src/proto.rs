@@ -1,36 +1,65 @@
-use crate::table::Table;
-use crate::{message, Error, LocalAdd, LocalStore};
-use crate::{KadMessage, KadMessageIn, Key, KeyLen, Node, Result};
+use crate::event::*;
+use crate::key::{Key, KeyLen};
+use crate::node::Node;
+use crate::table::{Table, K};
+use crate::{message, Error, Result};
+
 use actix::prelude::*;
 use chrono::Utc;
 use futures::channel::mpsc;
-use futures::{FutureExt, SinkExt};
+use futures::{Future, FutureExt, SinkExt};
 use generic_array::ArrayLength;
 use rand::RngCore;
 use std::collections::HashMap;
 use std::convert::TryFrom;
-use std::sync::Arc;
+use std::rc::Rc;
+use std::time::Duration;
 
-const BUCKET_SIZE: usize = 20;
+const ALPHA: usize = 3;
+
 const MAX_KEY_SZ: usize = 33;
-const MAX_VALUE_SZ: usize = 65536;
+const MAX_VAL_SZ: usize = 65535;
 const MAX_VALUES_TO_SEND: usize = 100;
 const MAX_TTL: u32 = 604800;
-const MAX_REQ_TTL: i64 = 300;
+const MAX_REQUEST_TTL: i64 = 15;
 
-pub struct Kad<N: KeyLen> {
-    table: Table<N>,
-    storage: HashMap<Vec<u8>, (message::Value, i64)>,
-    tx: mpsc::Sender<KadMessage>,
+const LOOKUP_TIMEOUT: i64 = 30;
+
+lazy_static::lazy_static! {
+    static ref REQUEST_UPKEEP_INTERVAL: Duration = Duration::from_secs(5);
+    static ref STORAGE_UPKEEP_INTERVAL: Duration = Duration::from_secs(60);
 }
 
-impl<N: KeyLen> Kad<N> {
-    pub fn new(me: Arc<Node<N>>, tx: mpsc::Sender<KadMessage>) -> Self {
+pub struct Kad<N>
+where
+    N: KeyLen + Unpin + 'static,
+    <N as ArrayLength<u8>>::ArrayType: Unpin,
+{
+    tx: mpsc::Sender<KadEvtSend<N>>,
+    table: Table<N>,
+    storage: HashMap<Vec<u8>, (message::Value, i64)>,
+    requests: HashMap<u32, (KadMessage, i64)>,
+    node_lookups: HashMap<Vec<u8>, Addr<NodeLookup<N>>>,
+}
+
+impl<N> Kad<N>
+where
+    N: KeyLen + Unpin + 'static,
+    <N as ArrayLength<u8>>::ArrayType: Unpin,
+{
+    pub fn new(me: Rc<Node<N>>, tx: mpsc::Sender<KadEvtSend<N>>) -> Self {
         Self {
-            table: Table::new(me, BUCKET_SIZE),
-            storage: HashMap::new(),
             tx,
+            table: Table::new(me, K),
+            storage: HashMap::new(),
+            requests: HashMap::new(),
+            node_lookups: HashMap::new(),
         }
+    }
+
+    #[inline]
+    pub fn add(&mut self, node: &Node<N>) {
+        self.table.add(&node);
     }
 
     pub fn keys_to_refresh(&self) -> Vec<Key<N>> {
@@ -41,121 +70,126 @@ impl<N: KeyLen> Kad<N> {
             .collect()
     }
 
-    fn values_to_transfer(&self, _: &Node<N>) -> Vec<message::Value> {
-        Vec::new()
+    #[inline]
+    fn timeout_storage(&mut self, _: &mut Context<Self>) {
+        let now = Utc::now().timestamp();
+        self.storage
+            .retain(|_, (value, created_at)| value.ttl as i64 + *created_at > now);
+    }
+
+    #[inline]
+    fn timeout_requests(&mut self, _: &mut Context<Self>) {
+        let now = Utc::now().timestamp();
+        self.requests
+            .retain(|_, (_, created_at)| now - *created_at < MAX_REQUEST_TTL);
     }
 }
 
-impl<N: KeyLen> Kad<N> {
-    fn find_node(&self, key: &Key<N>, excluded: Option<&Key<N>>) -> Vec<Node<N>> {
-        let mut nodes = self.table.neighbors(&key, excluded);
+impl<N> Kad<N>
+where
+    N: KeyLen + Unpin + 'static,
+    <N as ArrayLength<u8>>::ArrayType: Unpin,
+{
+    fn find_node(
+        &self,
+        key: &Key<N>,
+        excluded: Option<&Key<N>>,
+        max: Option<usize>,
+    ) -> Vec<Node<N>> {
+        let mut nodes = self.table.neighbors(&key, excluded, max);
         if key == &self.table.me.key {
+            if max.map(|m| m == nodes.len()).unwrap_or(false) {
+                nodes.remove(0);
+            }
             nodes.push((*self.table.me).clone());
         }
         nodes
     }
 
     fn find_value(&mut self, key: &Vec<u8>) -> Option<message::Value> {
-        let now = Utc::now().timestamp();
-        self.storage
-            .retain(|_, (value, created_at)| value.ttl as i64 + *created_at > now);
-
         match self.storage.get(key) {
-            Some((value, created_at)) => Some(message::Value {
-                value: value.value.clone(),
-                ttl: value.ttl - (now - created_at) as u32,
-            }),
+            Some((value, created_at)) => {
+                let lifetime = value.ttl as i64 - (Utc::now().timestamp() - created_at);
+                if lifetime > 0 {
+                    return Some(message::Value {
+                        value: value.value.clone(),
+                        ttl: lifetime as u32,
+                    });
+                }
+                None
+            }
             None => None,
         }
     }
 }
 
-//     def transferKeyValues(self, node):
-//         """
-//         Given a new node, send it all the keys/values it should be storing.
-//         @param node: A new node that just joined (or that we just found out
-//         about).
-//         Process:
-//         For each key in storage, get k closest nodes.  If newnode is closer
-//         than the furtherst in that list, and the node for this server
-//         is closer than the closest in that list, then store the key/value
-//         on the new node (per section 2.5 of the paper)
-//         """
-//         def send_values(inv_list):
-//             values = []
-//             if inv_list[0]:
-//                 for requested_inv in inv_list[1]:
-//                     try:
-//                         i = objects.Inv()
-//                         i.ParseFromString(requested_inv)
-//                         value = self.storage.getSpecific(i.keyword, i.valueKey)
-//                         if value is not None:
-//                             v = objects.Value()
-//                             v.keyword = i.keyword
-//                             v.valueKey = i.valueKey
-//                             v.serializedData = value
-//                             v.ttl = int(round(self.storage.get_ttl(i.keyword, i.valueKey)))
-//                             values.append(v.SerializeToString())
-//                     except Exception:
-//                         pass
-//                 if len(values) > 0:
-//                     self.callValues(node, values)
-//
-//         inv = []
-//         for keyword in self.storage.iterkeys():
-//             keyword = keyword[0].decode("hex")
-//             keynode = Node(keyword)
-//             neighbors = self.router.findNeighbors(keynode, exclude=node)
-//             if len(neighbors) > 0:
-//                 newNodeClose = node.distanceTo(keynode) < neighbors[-1].distanceTo(keynode)
-//                 thisNodeClosest = self.sourceNode.distanceTo(keynode) < neighbors[0].distanceTo(keynode)
-//             if len(neighbors) == 0 \
-//                     or (newNodeClose and thisNodeClosest) \
-//                     or (thisNodeClosest and len(neighbors) < self.ksize):
-//                 # pylint: disable=W0612
-//                 for k, v in self.storage.iteritems(keyword):
-//                     i = objects.Inv()
-//                     i.keyword = keyword
-//                     i.valueKey = k
-//                     inv.append(i.SerializeToString())
-//         if len(inv) > 100:
-//             random.shuffle(inv)
-//         if len(inv) > 0:
-//             self.callInv(node, inv[:100]).addCallback(send_values)
-
-impl<N: KeyLen> Actor for Kad<N>
+impl<N> Actor for Kad<N>
 where
     N: KeyLen + Unpin + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     type Context = Context<Self>;
+
+    fn started(&mut self, ctx: &mut Self::Context) {
+        IntervalFunc::new(*STORAGE_UPKEEP_INTERVAL, Self::timeout_storage)
+            .finish()
+            .spawn(ctx);
+        IntervalFunc::new(*REQUEST_UPKEEP_INTERVAL, Self::timeout_requests)
+            .finish()
+            .spawn(ctx);
+    }
 }
 
-impl<N: KeyLen> Handler<KadMessageIn<N>> for Kad<N>
+impl<N> Handler<KadEvtReceive<N>> for Kad<N>
 where
     N: KeyLen + Unpin + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     type Result = ActorResponse<Self, (), Error>;
 
-    fn handle(&mut self, msg: KadMessageIn<N>, ctx: &mut Context<Self>) -> Self::Result {
+    fn handle(&mut self, evt: KadEvtReceive<N>, ctx: &mut Context<Self>) -> Self::Result {
         let address = ctx.address();
-        let mut tx = self.tx.clone();
+        let (from, _new, msg) = (evt.from, evt.new, evt.message);
 
-        let fut = match msg.inner.clone() {
-            KadMessage::FindNode(m) => self.handle_find_node(m, &msg.sender.key).boxed_local(),
-            KadMessage::FindNodeResult(m) => self.handle_find_node_result().boxed_local(),
-            KadMessage::FindValue(m) => self.handle_find_value(m, &msg.sender.key).boxed_local(),
-            KadMessage::FindValueResult(m) => self.handle_find_value_result().boxed_local(),
-            KadMessage::Store(m) => self.handle_store(m, address.clone()).boxed_local(),
+        let add_msg = if !self.table.add(&from) {
+            Some(KadMessage::Ping(message::Ping {
+                rand_val: rand::thread_rng().next_u32(),
+            }))
+        // TODO: } else if new { transfer_values(..)
+        } else {
+            None
+        };
+
+        let handler_fut = match msg {
+            KadMessage::FindNode(m) => self.handle_find_node(m, &from.key).boxed_local(),
+            KadMessage::FindNodeResult(m) => {
+                self.handle_find_node_result(m, &from.key).boxed_local()
+            }
+            KadMessage::FindValue(m) => self.handle_find_value(m, &from.key).boxed_local(),
+            KadMessage::FindValueResult(m) => {
+                self.handle_find_value_result(m, &from.key).boxed_local()
+            }
+            KadMessage::Store(m) => self.handle_store(m).boxed_local(),
             KadMessage::Ping(m) => self.handle_ping(m).boxed_local(),
             _ => async move { Ok(None) }.boxed_local(),
         };
 
         let fut = async move {
-            address.send(LocalAdd(msg.sender, msg.new_conn)).await??;
-            if let Some(reply) = fut.await? {
-                tx.send(reply).await?;
+            if let Some(m) = add_msg {
+                address
+                    .send(EvtSend {
+                        to: from.clone(),
+                        message: m,
+                    })
+                    .await??;
+            }
+            if let Some(m) = handler_fut.await? {
+                address
+                    .send(EvtSend {
+                        to: from,
+                        message: m,
+                    })
+                    .await??;
             }
             Ok(())
         };
@@ -164,7 +198,7 @@ where
     }
 }
 
-type HandlerResult = Result<Option<KadMessage>>;
+type HandleMsgResult = Result<Option<KadMessage>>;
 
 impl<N> Kad<N>
 where
@@ -172,7 +206,7 @@ where
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     #[inline]
-    fn handle_ping(&mut self, msg: message::Ping) -> impl Future<Output = HandlerResult> {
+    fn handle_ping(&mut self, msg: message::Ping) -> impl Future<Output = HandleMsgResult> {
         async move {
             Ok(Some(KadMessage::Pong(message::Pong {
                 rand_val: msg.rand_val,
@@ -181,27 +215,42 @@ where
     }
 
     #[inline]
-    fn handle_store(
-        &mut self,
-        msg: message::Store,
-        address: Addr<Self>,
-    ) -> impl Future<Output = HandlerResult> {
-        async move {
-            let value = msg.value.ok_or(Error::message("Store: missing 'value'"))?;
-            address.send(LocalStore(msg.key, value)).await??;
-            Ok(None)
+    fn handle_store(&mut self, msg: message::Store) -> impl Future<Output = HandleMsgResult> {
+        let value = match msg.value {
+            Some(v) => v,
+            None => return Error::message("Store: missing 'value'").fut().left_future(),
+        };
+
+        if msg.key.len() > MAX_KEY_SZ {
+            return Error::property("Store", format!("key size > {}", MAX_KEY_SZ))
+                .fut()
+                .left_future();
         }
+        if value.value.len() > MAX_VAL_SZ {
+            return Error::property("Store", format!("value size > {}", MAX_VAL_SZ))
+                .fut()
+                .left_future();
+        }
+        if value.ttl > MAX_TTL {
+            return Error::property("Store", format!("ttl > {}", MAX_TTL))
+                .fut()
+                .left_future();
+        }
+
+        let now = Utc::now().timestamp();
+        self.storage.insert(msg.key, (value, now));
+        async move { Ok(None) }.right_future()
     }
 
     #[inline]
     fn handle_find_node(
         &mut self,
         msg: message::FindNode,
-        exclude: &Key<N>,
-    ) -> impl Future<Output = HandlerResult> {
+        from: &Key<N>,
+    ) -> impl Future<Output = HandleMsgResult> {
         let rand_val = msg.rand_val;
         let nodes = match Key::<N>::try_from(msg.key) {
-            Ok(key) => Ok(self.find_node(&key, Some(exclude))),
+            Ok(key) => Ok(self.find_node(&key, Some(from), Some(self.table.k))),
             Err(e) => Err(e),
         };
 
@@ -214,16 +263,44 @@ where
     }
 
     #[inline]
-    fn handle_find_node_result(&mut self) -> impl Future<Output = HandlerResult> {
-        async move { HandlerResult::Ok(None) }
+    fn handle_find_node_result(
+        &mut self,
+        msg: message::FindNodeResult,
+        from: &Key<N>,
+    ) -> impl Future<Output = HandleMsgResult> {
+        let lookup = self
+            .requests
+            .get(&msg.rand_val)
+            .map(|(m, _)| match m {
+                KadMessage::FindNode(msg) => self.node_lookups.get(&msg.key).cloned(),
+                _ => None,
+            })
+            .flatten()
+            .ok_or(Error::InvalidResponse("Request not found".to_owned()));
+
+        let from = from.clone();
+        async move {
+            lookup?
+                .send(EvtNodes {
+                    from,
+                    nodes: msg
+                        .nodes
+                        .into_iter()
+                        .map(Node::try_from)
+                        .filter_map(Result::ok)
+                        .collect(),
+                })
+                .await??;
+            Ok(None)
+        }
     }
 
     #[inline]
     fn handle_find_value(
         &mut self,
         msg: message::FindValue,
-        exclude: &Key<N>,
-    ) -> impl Future<Output = HandlerResult> {
+        from: &Key<N>,
+    ) -> impl Future<Output = HandleMsgResult> {
         use message::find_value_result::Result as Response;
 
         let reply = if let Some(value) = self.find_value(&msg.key) {
@@ -233,15 +310,16 @@ where
             })
         } else {
             match Key::<N>::try_from(msg.key) {
-                Ok(key) => {
-                    let nodes = self.find_node(&key, Some(exclude));
-                    Ok(message::FindValueResult {
-                        rand_val: msg.rand_val,
-                        result: Some(Response::Nodes(message::Nodes {
-                            nodes: nodes.into_iter().map(Node::into).collect(),
-                        })),
-                    })
-                }
+                Ok(key) => Ok(message::FindValueResult {
+                    rand_val: msg.rand_val,
+                    result: Some(Response::Nodes(message::Nodes {
+                        nodes: self
+                            .find_node(&key, Some(from), Some(self.table.k))
+                            .into_iter()
+                            .map(Node::into)
+                            .collect(),
+                    })),
+                }),
                 Err(e) => Err(e),
             }
         };
@@ -250,42 +328,47 @@ where
     }
 
     #[inline]
-    fn handle_find_value_result(&mut self) -> impl Future<Output = HandlerResult> {
+    fn handle_find_value_result(
+        &mut self,
+        _: message::FindValueResult,
+        _: &Key<N>,
+    ) -> impl Future<Output = HandleMsgResult> {
         async move { Ok(None) }
     }
 }
 
-impl<N> Handler<LocalAdd<N>> for Kad<N>
+impl<N> Handler<KadEvtFindNode<N>> for Kad<N>
+where
+    N: KeyLen + Unpin + 'static,
+    <N as ArrayLength<u8>>::ArrayType: Unpin,
+{
+    type Result = <KadEvtFindNode<N> as Message>::Result;
+
+    fn handle(&mut self, _: KadEvtFindNode<N>, _: &mut Context<Self>) -> Self::Result {}
+}
+
+impl<N> Handler<EvtSend<N>> for Kad<N>
 where
     N: KeyLen + Unpin + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     type Result = ActorResponse<Self, (), Error>;
 
-    fn handle(&mut self, msg: LocalAdd<N>, _: &mut Context<Self>) -> Self::Result {
-        let node = msg.0;
-        let new_conn = msg.1;
+    fn handle(&mut self, evt: EvtSend<N>, _: &mut Context<Self>) -> Self::Result {
+        if evt.message.is_request() {
+            self.requests.insert(
+                evt.message.rand_val(),
+                (evt.message.clone(), Utc::now().timestamp()),
+            );
+        }
+
         let mut tx = self.tx.clone();
-
-        let action = if !self.table.add(&node) {
-            Some(KadMessage::Ping(message::Ping {
-                rand_val: rand::thread_rng().next_u32(),
-            }))
-        } else if new_conn {
-            let values = self.values_to_transfer(&node);
-            // match values.len() {
-            //     0 => None,
-            //     _ => Some(KadMessage::Store(node.clone(), values)),
-            // }
-            None
-        } else {
-            None
-        };
-
         let fut = async move {
-            if let Some(a) = action {
-                tx.send(a).await?;
-            }
+            tx.send(KadEvtSend {
+                to: evt.to,
+                message: evt.message,
+            })
+            .await?;
             Ok(())
         };
 
@@ -293,31 +376,27 @@ where
     }
 }
 
-impl<N> Handler<LocalStore> for Kad<N>
+struct NodeLookup<N: KeyLen> {
+    key: Key<N>,
+    result: Option<Option<Node<N>>>,
+}
+
+impl<N> Actor for NodeLookup<N>
 where
     N: KeyLen + Unpin + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
-    type Result = <LocalStore as Message>::Result;
+    type Context = Context<Self>;
+}
 
-    fn handle(&mut self, msg: LocalStore, _: &mut Context<Self>) -> Self::Result {
-        if msg.0.len() > MAX_KEY_SZ {
-            return Err(Error::property(
-                "Store",
-                format!("key size > {}", MAX_KEY_SZ),
-            ));
-        }
-        if msg.1.value.len() > MAX_VALUE_SZ {
-            return Err(Error::property(
-                "Store",
-                format!("value size > {}", MAX_VALUE_SZ),
-            ));
-        }
-        if msg.1.ttl > MAX_TTL {
-            return Err(Error::property("Store", format!("ttl > {}", MAX_TTL)));
-        }
+impl<N> Handler<EvtNodes<N>> for NodeLookup<N>
+where
+    N: KeyLen + Unpin + 'static,
+    <N as ArrayLength<u8>>::ArrayType: Unpin,
+{
+    type Result = <EvtNodes<N> as Message>::Result;
 
-        self.storage.insert(msg.0, (msg.1, Utc::now().timestamp()));
-        Ok(())
+    fn handle(&mut self, _: EvtNodes<N>, _: &mut Context<Self>) -> Self::Result {
+        unimplemented!()
     }
 }

@@ -5,7 +5,7 @@ use rand::Rng;
 use std::cmp::min;
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::rc::Rc;
 
 type Size = U512;
 
@@ -84,7 +84,7 @@ fn main() {
     let node_count = 128;
     let neigh_count = 32;
 
-    let me = Arc::new(Node {
+    let me = Rc::new(Node {
         key: gen_key(),
         address: gen_address(),
     });
@@ -96,7 +96,7 @@ fn main() {
         table.add(n);
     });
 
-    let neighbours = table.neighbors(&me.key, Some(&me.key));
+    let neighbours = table.neighbors(&me.key, Some(&me.key), None);
     let len = min(neigh_count, neighbours.len());
 
     let expected = nodes
