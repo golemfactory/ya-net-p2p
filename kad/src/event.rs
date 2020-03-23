@@ -17,13 +17,14 @@ pub struct KadEvtReceive<N: KeyLen> {
 }
 
 #[derive(Clone, Debug, Message)]
-#[rtype(result = "Result<Option<Node<N>>")]
-pub struct KadEvtFindNode<N: KeyLen> {
+#[rtype(result = "Result<Option<Node<N>>>")]
+pub struct KadEvtFindNode<N: KeyLen + 'static> {
     pub key: Key<N>,
+    pub timeout: f64,
 }
 
 #[derive(Clone, Debug, Message)]
-#[rtype(result = "Result<Option<(Vec<u8>, Vec<u8>)>")]
+#[rtype(result = "Result<Option<(Vec<u8>, Vec<u8>)>>")]
 pub struct KadEvtFindValue {
     pub key: Vec<u8>,
 }
@@ -75,9 +76,17 @@ pub(crate) struct EvtSend<N: KeyLen> {
     pub message: KadMessage,
 }
 
-#[derive(Clone, Debug, Message)]
-#[rtype(result = "Result<()>")]
-pub(crate) struct EvtNodes<N: KeyLen> {
-    pub from: Key<N>,
-    pub nodes: Vec<Node<N>>,
+impl<N: KeyLen> EvtSend<N> {
+    pub fn new(to: Node<N>, message: KadMessage) -> Self {
+        Self { to, message }
+    }
+}
+
+impl<N: KeyLen> From<EvtSend<N>> for KadEvtSend<N> {
+    fn from(evt: EvtSend<N>) -> Self {
+        Self {
+            to: evt.to,
+            message: evt.message,
+        }
+    }
 }

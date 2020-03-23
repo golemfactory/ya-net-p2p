@@ -24,6 +24,12 @@ impl<N: KeyLen> Table<N> {
         }
     }
 
+    #[inline]
+    pub fn get(&self, key: &Key<N>) -> Option<&Node<N>> {
+        let idx = self.bucket_index(&key);
+        self.buckets[idx].get(key)
+    }
+
     pub fn add(&mut self, node: &Node<N>) -> bool {
         self.dedup(&node);
 
@@ -170,6 +176,13 @@ impl<N: KeyLen> Bucket<N> {
             updated: Utc::now(),
             range,
             k,
+        }
+    }
+
+    fn get(&self, key: &Key<N>) -> Option<&Node<N>> {
+        match self.inner.iter().position(|x| &x.key == key) {
+            Some(i) => Some(&self.inner[i]),
+            None => None,
         }
     }
 

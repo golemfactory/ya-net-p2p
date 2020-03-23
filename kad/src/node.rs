@@ -1,6 +1,6 @@
 use crate::{message, Error, Key, KeyLen, Result};
 use std::convert::TryFrom;
-use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct Node<N: KeyLen> {
@@ -38,13 +38,12 @@ impl<N: KeyLen> TryFrom<message::Node> for Node<N> {
             address: match node.ip {
                 Some(node_ip) => match node_ip {
                     message::node::Ip::V4(ip) => {
-                        SocketAddr::from(SocketAddrV4::new(ip.into(), node.port as u16))
+                        SocketAddr::from((Ipv4Addr::from(ip), node.port as u16))
                     }
                     message::node::Ip::V6(v6) => {
                         let mut ip = (v6.hi << 64) as u128;
                         ip |= v6.lo as u128;
-
-                        SocketAddr::from(SocketAddrV6::new(ip.into(), node.port as u16, 0, 0))
+                        SocketAddr::from((Ipv6Addr::from(ip), node.port as u16))
                     }
                 },
                 None => return Err(Error::property("Node", "ip == None")),
