@@ -197,6 +197,37 @@ where
     }
 }
 
+impl<N> Handler<KadEvtBootstrap<N>> for Kad<N>
+where
+    N: KeyLen + Unpin + 'static,
+    <N as ArrayLength<u8>>::ArrayType: Unpin,
+{
+    type Result = ActorResponse<Self, (), Error>;
+
+    fn handle(&mut self, msg: KadEvtBootstrap<N>, ctx: &mut Context<Self>) -> Self::Result {
+        let address = ctx.address();
+        let my_key = self.me.key.as_ref().to_vec();
+
+        msg.nodes.iter().for_each(|node| {
+            self.table.add(&node);
+        });
+
+        let fut = async move {
+            let mut rng = rand::thread_rng();
+            for to in msg.nodes {
+                let message = KadMessage::FindNode(message::FindNode {
+                    rand_val: rng.next_u32(),
+                    key: my_key.clone(),
+                });
+                let _ = address.send(EvtSend { to, message }).await;
+            }
+            Ok(())
+        };
+
+        ActorResponse::r#async(fut.into_actor(self))
+    }
+}
+
 impl<N> Handler<KadEvtReceive<N>> for Kad<N>
 where
     N: KeyLen + Unpin + 'static,
@@ -312,11 +343,6 @@ where
         msg: message::FindNodeResult,
         from: &Key<N>,
     ) -> impl Future<Output = HandleMsgResult> {
-        let mut lookup = match self.find_lookup(msg.rand_val) {
-            Ok(lookup) => lookup,
-            Err(error) => return error.fut().left_future(),
-        };
-
         let nodes = msg
             .nodes
             .into_iter()
@@ -324,16 +350,29 @@ where
             .filter_map(Result::ok)
             .collect::<Vec<_>>();
 
-        let node_idx = nodes
-            .iter()
-            .take(K)
-            .position(|n| n.key.as_ref() == lookup.key.as_ref());
+        match self.find_lookup(msg.rand_val) {
+            Ok(mut lookup) => {
+                let node_idx = nodes
+                    .iter()
+                    .take(K)
+                    .position(|n| n.key.as_ref() == lookup.key.as_ref());
 
-        if let Some(idx) = node_idx {
-            lookup.finish(LookupValue::Node(nodes[idx].clone()));
-        } else {
-            lookup.feed(from, nodes);
-        }
+                if let Some(idx) = node_idx {
+                    lookup.finish(LookupValue::Node(nodes[idx].clone()));
+                } else {
+                    lookup.feed(from, nodes);
+                }
+            }
+            Err(error) => match error {
+                Error::InvalidLookup(_) => {
+                    log::debug!("{:?}", error);
+                    nodes.into_iter().for_each(|n| {
+                        self.table.add(&n);
+                    });
+                }
+                _ => return error.fut().left_future(),
+            },
+        };
 
         async move { Ok(None) }.right_future()
     }

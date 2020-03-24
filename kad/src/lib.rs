@@ -30,8 +30,10 @@ pub enum Error {
     InvalidMessage(String),
     #[error("Invalid property {1} in message {0}")]
     InvalidProperty(String, String),
-    #[error("Invalid response: {0}")]
-    InvalidResponse(String),
+    #[error("Missing request: {0}")]
+    MissingRequest(String),
+    #[error("Invalid lookup: {0}")]
+    InvalidLookup(String),
 }
 
 impl Error {
@@ -47,12 +49,12 @@ impl Error {
 
     #[inline]
     pub fn request(rand_val: u32) -> Self {
-        Error::InvalidResponse(format!("Request for {} not found", rand_val))
+        Error::MissingRequest(format!("Request for {} not found", rand_val))
     }
 
     #[inline]
     pub fn lookup(key: &Vec<u8>) -> Self {
-        Error::InvalidResponse(format!("Lookup for {} not found", hex::encode(key)))
+        Error::InvalidLookup(format!("Lookup for {} not found", hex::encode(key)))
     }
 
     #[inline]
