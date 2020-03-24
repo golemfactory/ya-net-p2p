@@ -583,7 +583,12 @@ where
     }
 
     pub fn finish(&mut self, result: LookupValue<N>) {
+        let mut replace = false;
         if let LookupState::InProgress { .. } = &*self.state.borrow() {
+            replace = true;
+        }
+
+        if replace {
             self.state.replace(LookupState::Finished { result });
             if let Some(waker) = &self.waker {
                 waker.wake_by_ref();
