@@ -10,6 +10,7 @@ use futures::channel::mpsc;
 use futures::task::{Poll, Waker};
 use futures::{Future, FutureExt, SinkExt};
 use generic_array::ArrayLength;
+use itertools::Itertools;
 use rand::RngCore;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -17,7 +18,6 @@ use std::convert::TryFrom;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
-use tokio::time::timeout;
 
 const ALPHA: usize = 8;
 
@@ -83,59 +83,15 @@ where
     }
 
     #[inline]
-    fn lookup_upkeep(&mut self, ctx: &mut Context<Self>) {
+    fn lookup_upkeep(&mut self, _: &mut Context<Self>) {
         let now = Utc::now().timestamp();
-        let address = ctx.address();
-
-        self.lookups.retain(|key, (lookup, created_at)| {
-            let dt = now - *created_at;
-            if dt >= MAX_LOOKUP_TTL {
-                log::debug!("Lookup of {} failed after {} s", hex::encode(key), dt);
-                lookup.complete(LookupValue::None);
-                return false;
+        self.lookups.retain(|_, (lookup, created_at)| {
+            if now - *created_at >= MAX_LOOKUP_TTL {
+                lookup.finish(LookupValue::None);
+            } else {
+                lookup.iterate();
             }
-
-            let nodes = {
-                let mut state = lookup.state.borrow_mut();
-                if let LookupState::InProgress {
-                    started_at,
-                    pending,
-                    ..
-                } = &mut *state {
-                    if now - *started_at > MAX_REQ_TTL {
-                        pending.clear();
-                    }
-                    if pending.is_empty() {
-                        Some(state.next_round())
-                    } else {
-                        None
-                    }
-                } else { None }
-            };
-
-            if let Some(nodes) = nodes {
-                match nodes.len() {
-                    0 => {
-                        log::debug!("Lookup of {} failed after {} s - did not receive node information in time", hex::encode(key), dt);
-                        lookup.complete(LookupValue::None);
-                    },
-                    _ => {
-                        let address = address.clone();
-                        let key = key.clone();
-                        actix_rt::spawn(async move {
-                            for to in nodes.into_iter() {
-                                let message = KadMessage::FindNode(message::FindNode {
-                                    rand_val: rand::thread_rng().next_u32(),
-                                    key: key.clone(),
-                                });
-                                let _ = address.send(EvtSend { to, message }).await;
-                            }
-                        });
-                    }
-                }
-            }
-
-            true
+            lookup.in_progress()
         });
     }
 }
@@ -149,11 +105,11 @@ where
         &self,
         key: &Key<N>,
         excluded: Option<&Key<N>>,
-        max: Option<usize>,
+        limit: Option<usize>,
     ) -> Vec<Node<N>> {
-        let mut nodes = self.table.neighbors(&key, excluded, max);
+        let mut nodes = self.table.neighbors(&key, excluded, limit);
         if key == &self.table.me.key {
-            if max.map(|m| m == nodes.len()).unwrap_or(false) {
+            if limit.map(|l| l == nodes.len()).unwrap_or(false) {
                 nodes.remove(0);
             }
             nodes.push((*self.table.me).clone());
@@ -172,6 +128,49 @@ where
             }
         }
         None
+    }
+
+    fn find_lookup(&self, rand_val: u32) -> Result<Lookup<N>> {
+        let key_opt = self
+            .requests
+            .get(&rand_val)
+            .map(|(m, _)| m.searched_key())
+            .flatten();
+
+        let key = match key_opt {
+            Some(key) => key,
+            None => return Err(Error::request(rand_val)),
+        };
+
+        match self.lookups.get(&key) {
+            Some((lookup, _)) => Ok(lookup.clone()),
+            None => Err(Error::lookup(&key)),
+        }
+    }
+
+    fn initiate_lookup(
+        &mut self,
+        lookup_key: LookupKey,
+        node_key: &Key<N>,
+        address: Addr<Self>,
+    ) -> Lookup<N> {
+        if let Some((lookup, _)) = self.lookups.get(lookup_key.as_ref()) {
+            return lookup.clone();
+        }
+
+        let nodes = self.find_node(node_key, None, Some(K));
+        let lookup = self
+            .lookups
+            .entry(lookup_key.as_ref().to_vec())
+            .or_insert((
+                Lookup::new(lookup_key, &nodes, address),
+                Utc::now().timestamp(),
+            ))
+            .0
+            .clone();
+
+        lookup.send_out(nodes);
+        lookup
     }
 }
 
@@ -206,7 +205,7 @@ where
         let address = ctx.address();
         let (from, _new, msg) = (evt.from, evt.new, evt.message);
 
-        let add_msg = if !self.table.add(&from) {
+        let msg_opt = if !self.table.add(&from) {
             Some(KadMessage::Ping(message::Ping {
                 rand_val: rand::thread_rng().next_u32(),
             }))
@@ -217,20 +216,16 @@ where
 
         let handler_fut = match msg {
             KadMessage::FindNode(m) => self.handle_find_node(m, &from.key).boxed_local(),
-            KadMessage::FindNodeResult(m) => {
-                self.handle_find_node_result(m, &from.key).boxed_local()
-            }
+            KadMessage::FindNodeResult(m) => self.handle_node_result(m, &from.key).boxed_local(),
             KadMessage::FindValue(m) => self.handle_find_value(m, &from.key).boxed_local(),
-            KadMessage::FindValueResult(m) => {
-                self.handle_find_value_result(m, &from.key).boxed_local()
-            }
+            KadMessage::FindValueResult(m) => self.handle_value_result(m, &from.key).boxed_local(),
             KadMessage::Store(m) => self.handle_store(m).boxed_local(),
             KadMessage::Ping(m) => self.handle_ping(m).boxed_local(),
             _ => async move { Ok(None) }.boxed_local(),
         };
 
         let fut = async move {
-            if let Some(m) = add_msg {
+            if let Some(m) = msg_opt {
                 address.send(EvtSend::new(from.clone(), m)).await??;
             }
             if let Some(m) = handler_fut.await? {
@@ -309,30 +304,14 @@ where
     }
 
     #[inline]
-    fn handle_find_node_result(
+    fn handle_node_result(
         &mut self,
         msg: message::FindNodeResult,
         from: &Key<N>,
     ) -> impl Future<Output = HandleMsgResult> {
-        let key_opt = self
-            .requests
-            .get(&msg.rand_val)
-            .map(|(m, _)| match m {
-                KadMessage::FindNode(msg) => Some(msg.key.clone()),
-                _ => None,
-            })
-            .flatten();
-        let key_vec = match key_opt {
-            Some(key) => key,
-            None => return Error::request(msg.rand_val).fut().left_future(),
-        };
-        let key = match Key::<N>::try_from(key_vec.clone()) {
-            Ok(key) => key,
-            Err(e) => return e.fut().left_future(),
-        };
-        let mut lookup = match self.lookups.get(&key_vec) {
-            Some(lookup) => lookup.0.clone(),
-            None => return Error::lookup(&key_vec).fut().left_future(),
+        let mut lookup = match self.find_lookup(msg.rand_val) {
+            Ok(lookup) => lookup,
+            Err(error) => return error.fut().left_future(),
         };
 
         let nodes = msg
@@ -342,10 +321,15 @@ where
             .filter_map(Result::ok)
             .collect::<Vec<_>>();
 
-        if let Some(idx) = nodes.iter().position(|n| &n.key == &key) {
-            lookup.complete(LookupValue::Node(nodes[idx].clone()));
+        let node_idx = nodes
+            .iter()
+            .take(K)
+            .position(|n| n.key.as_ref() == lookup.key.as_ref());
+
+        if let Some(idx) = node_idx {
+            lookup.finish(LookupValue::Node(nodes[idx].clone()));
         } else {
-            lookup.state.borrow_mut().feed(&key, from, nodes);
+            lookup.feed(from, nodes);
         }
 
         async move { Ok(None) }.right_future()
@@ -383,12 +367,37 @@ where
     }
 
     #[inline]
-    fn handle_find_value_result(
+    fn handle_value_result(
         &mut self,
-        _: message::FindValueResult,
-        _: &Key<N>,
+        msg: message::FindValueResult,
+        from: &Key<N>,
     ) -> impl Future<Output = HandleMsgResult> {
-        async move { Ok(None) }
+        let mut lookup = match self.find_lookup(msg.rand_val) {
+            Ok(lookup) => lookup,
+            Err(error) => return error.fut().left_future(),
+        };
+
+        let result = match msg.result {
+            Some(result) => result,
+            None => return Error::property("result", "missing").fut().left_future(),
+        };
+
+        match result {
+            message::find_value_result::Result::Nodes(res) => {
+                let nodes = res
+                    .nodes
+                    .into_iter()
+                    .map(Node::<N>::try_from)
+                    .filter_map(Result::ok)
+                    .collect::<Vec<_>>();
+                lookup.feed(from, nodes);
+            }
+            message::find_value_result::Result::Value(res) => {
+                lookup.finish(LookupValue::Value(res.value));
+            }
+        }
+
+        async move { Ok(None) }.right_future()
     }
 }
 
@@ -400,43 +409,46 @@ where
     type Result = ActorResponse<Self, Option<Node<N>>, Error>;
 
     fn handle(&mut self, msg: KadEvtFindNode<N>, ctx: &mut Context<Self>) -> Self::Result {
-        if let Some(node) = self.table.get(&msg.key).cloned() {
-            return ActorResponse::reply(Ok(Some(node)));
+        if let Some(node) = self.table.get(&msg.key) {
+            return ActorResponse::reply(Ok(Some(node.clone())));
         }
 
-        let address = ctx.address();
-        let key = msg.key.as_ref().to_vec();
-
-        let lookup = match self.lookups.get(&key) {
-            Some((lookup, _)) => lookup.clone().left_future(),
-            None => {
-                let nodes = self.find_node(&msg.key, None, Some(ALPHA));
-                let lookup = self
-                    .lookups
-                    .entry(key.clone())
-                    .or_insert_with(|| Lookup::new_entry(&nodes))
-                    .0
-                    .clone();
-
-                async move {
-                    for to in nodes.into_iter() {
-                        let message = KadMessage::FindNode(message::FindNode {
-                            rand_val: rand::thread_rng().next_u32(),
-                            key: key.clone(),
-                        });
-                        let _ = address.send(EvtSend { to, message }).await;
-                    }
-                    lookup.await
-                }
-                .right_future()
+        let lookup_key = LookupKey::Node(msg.key.as_ref().to_vec());
+        let lookup = self.initiate_lookup(lookup_key, &msg.key, ctx.address());
+        let fut = async move {
+            match lookup.await {
+                LookupValue::Node(val) => Ok(Some(val)),
+                _ => Ok(None),
             }
         };
 
+        ActorResponse::r#async(fut.into_actor(self))
+    }
+}
+
+impl<N> Handler<KadEvtFindValue> for Kad<N>
+where
+    N: KeyLen + Unpin + 'static,
+    <N as ArrayLength<u8>>::ArrayType: Unpin,
+{
+    type Result = ActorResponse<Self, Option<(Vec<u8>, Vec<u8>)>, Error>;
+
+    fn handle(&mut self, msg: KadEvtFindValue, ctx: &mut Context<Self>) -> Self::Result {
+        if let Some(msg_value) = self.find_value(&msg.key) {
+            return ActorResponse::reply(Ok(Some((msg.key, msg_value.value.clone()))));
+        }
+
+        let node_key = match Key::<N>::try_from(msg.key.clone()) {
+            Ok(key) => key,
+            Err(error) => return ActorResponse::reply(Err(error)),
+        };
+        let lookup_key = LookupKey::Value(msg.key.clone());
+        let lookup = self.initiate_lookup(lookup_key, &node_key, ctx.address());
         let fut = async move {
-            timeout(Duration::from_secs_f64(msg.timeout), lookup)
-                .await
-                .map_err(Error::from)
-                .map(|v| v.to_node())
+            match lookup.await {
+                LookupValue::Value(val) => Ok(Some((msg.key, val))),
+                _ => Ok(None),
+            }
         };
 
         ActorResponse::r#async(fut.into_actor(self))
@@ -465,43 +477,131 @@ where
 }
 
 #[derive(Clone)]
-struct Lookup<N: KeyLen> {
+pub(crate) struct Lookup<N>
+where
+    N: KeyLen + Unpin + 'static,
+    <N as ArrayLength<u8>>::ArrayType: Unpin,
+{
+    key: LookupKey,
+    kad: Addr<Kad<N>>,
     state: Rc<RefCell<LookupState<N>>>,
     waker: Option<Waker>,
 }
 
-impl<N: KeyLen> Lookup<N> {
-    pub fn new(state: LookupState<N>) -> Self {
-        let state = Rc::new(RefCell::new(state));
-        Lookup { state, waker: None }
+impl<N> Lookup<N>
+where
+    N: KeyLen + Unpin + 'static,
+    <N as ArrayLength<u8>>::ArrayType: Unpin,
+{
+    pub fn new(key: LookupKey, nodes: &Vec<Node<N>>, kad: Addr<Kad<N>>) -> Self {
+        let state = Rc::new(RefCell::new(LookupState::new(nodes)));
+        Lookup {
+            key,
+            kad,
+            state,
+            waker: None,
+        }
     }
 
-    pub fn new_entry(nodes: &Vec<Node<N>>) -> (Self, i64) {
-        (
-            Self::new(LookupState::new(nodes.clone())),
-            Utc::now().timestamp(),
-        )
-    }
-}
-
-impl<N: KeyLen> Lookup<N> {
     #[inline]
-    pub fn complete(&mut self, result: LookupValue<N>) {
+    pub fn in_progress(&self) -> bool {
         if let LookupState::InProgress { .. } = &*self.state.borrow() {
-            self.state.replace(LookupState::Completed { result });
+            return true;
         }
-        if let Some(waker) = &self.waker {
-            waker.wake_by_ref();
+        false
+    }
+
+    pub fn feed(&mut self, from: &Key<N>, nodes: Vec<Node<N>>) {
+        if let LookupState::InProgress {
+            started_at: _,
+            pending,
+            candidates,
+        } = &mut *self.state.borrow_mut()
+        {
+            pending.remove(from);
+            *candidates = std::mem::replace(candidates, Vec::new())
+                .into_iter()
+                .chain(nodes.into_iter())
+                .sorted_by_key(|n| n.key.distance(&self.key))
+                .take(K)
+                .collect();
+        }
+    }
+
+    pub fn iterate(&mut self) {
+        let mut finish = false;
+
+        if let LookupState::InProgress {
+            started_at,
+            pending,
+            candidates,
+        } = &mut *self.state.borrow_mut()
+        {
+            if Utc::now().timestamp() - *started_at > MAX_REQ_TTL {
+                pending.clear();
+            }
+
+            if pending.is_empty() {
+                let mut nodes = std::mem::replace(candidates, Vec::new());
+                *candidates = nodes.split_off(std::cmp::min(nodes.len(), ALPHA));
+                *pending = nodes.iter().map(|n| n.key.clone()).collect();
+                *started_at = Utc::now().timestamp();
+
+                if nodes.is_empty() {
+                    finish = true;
+                } else {
+                    self.send_out(nodes);
+                }
+            }
+        }
+
+        if finish {
+            self.finish(LookupValue::None);
+        }
+    }
+
+    pub fn send_out(&self, nodes: Vec<Node<N>>) {
+        let address = self.kad.clone();
+        let key = self.key.clone();
+
+        actix_rt::spawn(async move {
+            for to in nodes.into_iter() {
+                let rand_val = rand::thread_rng().next_u32();
+                let message = match &key {
+                    LookupKey::Node(key) => KadMessage::FindNode(message::FindNode {
+                        rand_val,
+                        key: key.clone(),
+                    }),
+                    LookupKey::Value(key) => KadMessage::FindValue(message::FindValue {
+                        rand_val,
+                        key: key.clone(),
+                    }),
+                };
+                let _ = address.send(EvtSend { to, message }).await;
+            }
+        });
+    }
+
+    pub fn finish(&mut self, result: LookupValue<N>) {
+        if let LookupState::InProgress { .. } = &*self.state.borrow() {
+            self.state.replace(LookupState::Finished { result });
+            if let Some(waker) = &self.waker {
+                waker.wake_by_ref();
+            }
         }
     }
 }
 
-impl<N: KeyLen> Future for Lookup<N> {
+impl<N> Future for Lookup<N>
+where
+    N: KeyLen + Unpin + 'static,
+    <N as ArrayLength<u8>>::ArrayType: Unpin,
+{
     type Output = LookupValue<N>;
 
     #[inline]
     fn poll(mut self: Pin<&mut Self>, cx: &mut futures::task::Context<'_>) -> Poll<Self::Output> {
-        if let LookupState::Completed { result } = &*self.state.borrow() {
+        if let LookupState::Finished { result } = &*self.state.borrow() {
             return Poll::Ready(result.clone());
         }
 
@@ -517,47 +617,14 @@ pub(crate) enum LookupState<N: KeyLen> {
         pending: HashSet<Key<N>>,
         candidates: Vec<Node<N>>,
     },
-    Completed {
+    Finished {
         result: LookupValue<N>,
     },
 }
 
 impl<N: KeyLen> LookupState<N> {
-    pub fn feed(&mut self, key: &Key<N>, from: &Key<N>, nodes: Vec<Node<N>>) {
-        match self {
-            LookupState::InProgress {
-                started_at: _,
-                pending,
-                candidates,
-            } => {
-                pending.remove(from);
-                candidates.extend(nodes.iter().cloned());
-                candidates.sort_by_key(|n| key.distance(&n.key));
-                candidates.truncate(K);
-            }
-            _ => (),
-        }
-    }
-
-    pub fn next_round(&mut self) -> Vec<Node<N>> {
-        match self {
-            LookupState::InProgress {
-                started_at,
-                pending,
-                candidates,
-            } => {
-                *started_at = Utc::now().timestamp();
-                *pending = candidates.iter().map(|n| n.key.clone()).collect();
-                std::mem::replace(candidates, Vec::new())
-            }
-            _ => Vec::new(),
-        }
-    }
-}
-
-impl<N: KeyLen> LookupState<N> {
-    pub fn new(nodes: Vec<Node<N>>) -> Self {
-        let keys = nodes.into_iter().map(|n| n.key).collect();
+    pub fn new(nodes: &Vec<Node<N>>) -> Self {
+        let keys = nodes.into_iter().map(|n| n.key.clone()).collect();
         LookupState::InProgress {
             started_at: Utc::now().timestamp(),
             pending: keys,
@@ -567,26 +634,23 @@ impl<N: KeyLen> LookupState<N> {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum LookupValue<N: KeyLen> {
-    Node(Node<N>),
-    #[allow(dead_code)]
+pub(crate) enum LookupKey {
+    Node(Vec<u8>),
     Value(Vec<u8>),
-    None,
 }
 
-impl<N: KeyLen> LookupValue<N> {
-    pub fn to_node(&self) -> Option<Node<N>> {
+impl AsRef<[u8]> for LookupKey {
+    fn as_ref(&self) -> &[u8] {
         match &self {
-            LookupValue::Node(opt) => Some(opt.clone()),
-            _ => None,
+            LookupKey::Node(v) => &v,
+            LookupKey::Value(v) => &v,
         }
     }
+}
 
-    #[allow(dead_code)]
-    pub fn to_value(&self) -> Option<Vec<u8>> {
-        match &self {
-            LookupValue::Value(opt) => Some(opt.clone()),
-            _ => None,
-        }
-    }
+#[derive(Clone, Debug)]
+pub(crate) enum LookupValue<N: KeyLen> {
+    Node(Node<N>),
+    Value(Vec<u8>),
+    None,
 }

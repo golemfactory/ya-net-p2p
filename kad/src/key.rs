@@ -38,6 +38,7 @@ impl<N: KeyLen> Key<N> {
             max(&self_range.start, &range.start),
             min(&self_range.end, &range.end),
         );
+
         Self::try_from(big.to_bytes_be()).unwrap()
     }
 
@@ -48,12 +49,23 @@ impl<N: KeyLen> Key<N> {
         }
     }
 
-    pub fn distance(&self, other: &Self) -> Self {
+    pub fn distance<O: AsRef<[u8]>>(&self, other: &O) -> Self {
+        let other = other.as_ref();
+        let other_len = other.len();
+        let len = N::to_usize();
+        let diff = if other_len > len {
+            return Self {
+                inner: GenericArray::<u8, N>::generate(|_| 0xff),
+            };
+        } else {
+            len - other_len
+        };
+
         Self {
             inner: GenericArray::<u8, N>::from_iter(
                 self.inner
                     .iter()
-                    .zip(other.inner.iter())
+                    .zip(std::iter::repeat(&0u8).take(diff).chain(other.iter()))
                     .map(|(f, s)| f ^ s),
             ),
         }
@@ -70,18 +82,18 @@ impl<N: KeyLen> AsRef<[u8]> for Key<N> {
 impl<N: KeyLen> TryFrom<Vec<u8>> for Key<N> {
     type Error = Error;
 
-    fn try_from(vec: Vec<u8>) -> Result<Self, Self::Error> {
-        let len = vec.len();
-        let n = N::to_usize();
-        let dl = if len > n {
-            return Err(Error::InvalidKeyLength(len));
+    fn try_from(other: Vec<u8>) -> Result<Self, Self::Error> {
+        let other_len = other.len();
+        let len = N::to_usize();
+        let diff = if other_len > len {
+            return Err(Error::InvalidKeyLength(other_len));
         } else {
-            n - len
+            len - other_len
         };
 
         Ok(Key {
             inner: GenericArray::<u8, N>::from_iter(
-                std::iter::repeat(0u8).take(dl).chain(vec.into_iter()),
+                std::iter::repeat(0u8).take(diff).chain(other.into_iter()),
             ),
         })
     }

@@ -22,8 +22,6 @@ pub enum Error {
     SendError(#[from] futures::channel::mpsc::SendError),
     #[error("Mailbox error: {0}")]
     MailboxError(#[from] actix::MailboxError),
-    #[error("Timeout: {0}")]
-    Timeout(#[from] tokio::time::Elapsed),
     #[error("Invalid key length: {0}")]
     InvalidKeyLength(usize),
     #[error("Invalid lookup value: {0}")]

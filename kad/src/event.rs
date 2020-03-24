@@ -30,6 +30,12 @@ pub struct KadEvtFindValue {
 }
 
 #[derive(Clone, Debug, Message)]
+#[rtype(result = "Result<()>")]
+pub struct KadEvtBootstrap<N: KeyLen> {
+    pub nodes: Vec<Node<N>>,
+}
+
+#[derive(Clone, Debug, Message)]
 #[rtype(result = "()")]
 pub enum KadMessage {
     Ping(message::Ping),
@@ -54,6 +60,14 @@ impl KadMessage {
 
     pub fn is_response(&self) -> bool {
         !self.is_request()
+    }
+
+    pub fn searched_key(&self) -> Option<Vec<u8>> {
+        match &self {
+            KadMessage::FindNode(m) => Some(m.key.clone()),
+            KadMessage::FindValue(m) => Some(m.key.clone()),
+            _ => None,
+        }
     }
 
     pub fn rand_val(&self) -> u32 {
