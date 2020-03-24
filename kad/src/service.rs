@@ -39,6 +39,7 @@ where
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     tx: mpsc::Sender<KadEvtSend<N>>,
+    me: Rc<Node<N>>,
     table: Table<N>,
     storage: HashMap<Vec<u8>, (message::Value, i64)>,
     lookups: HashMap<Vec<u8>, (Lookup<N>, i64)>,
@@ -51,9 +52,11 @@ where
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     pub fn new(me: Rc<Node<N>>, tx: mpsc::Sender<KadEvtSend<N>>) -> Self {
+        let key = me.key.clone();
         Self {
             tx,
-            table: Table::new(me, K),
+            me,
+            table: Table::new(key, K),
             storage: HashMap::new(),
             lookups: HashMap::new(),
             requests: HashMap::new(),
@@ -108,11 +111,11 @@ where
         limit: Option<usize>,
     ) -> Vec<Node<N>> {
         let mut nodes = self.table.neighbors(&key, excluded, limit);
-        if key == &self.table.me.key {
+        if key == &self.me.key {
             if limit.map(|l| l == nodes.len()).unwrap_or(false) {
                 nodes.remove(0);
             }
-            nodes.push((*self.table.me).clone());
+            nodes.push((*self.me).clone());
         }
         nodes
     }

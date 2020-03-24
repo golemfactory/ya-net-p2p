@@ -3,22 +3,23 @@ use crate::{Key, KeyLen, Node};
 use chrono::{DateTime, Duration, Utc};
 use itertools::Itertools;
 use num_bigint::{BigUint, ToBigUint};
+use serde::{Deserialize, Serialize};
 use std::ops::Range;
-use std::rc::Rc;
 
 const BUCKET_REFRESH_INTERVAL: i64 = 3600;
 pub const K: usize = 20;
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Table<N: KeyLen> {
-    pub me: Rc<Node<N>>,
+    pub key: Key<N>,
     buckets: Vec<Bucket<N>>,
     pub k: usize,
 }
 
 impl<N: KeyLen> Table<N> {
-    pub fn new(me: Rc<Node<N>>, k: usize) -> Self {
+    pub fn new(key: Key<N>, k: usize) -> Self {
         Table {
-            me,
+            key,
             buckets: vec![Bucket::new(Key::<N>::range(), k)],
             k,
         }
@@ -40,7 +41,7 @@ impl<N: KeyLen> Table<N> {
             true
         // Per section 4.2 of paper, split if the bucket has the node in its range
         // or if the depth is not congruent to 0 mod 5
-        } else if bucket.in_range(&self.me) || bucket.depth() % 5 != 0 {
+        } else if bucket.in_range(&self.key) || bucket.depth() % 5 != 0 {
             self.split(idx);
             self.add(node)
         } else {
@@ -75,7 +76,7 @@ impl<N: KeyLen> Table<N> {
             .filter(|n| excluded.map(|e| &n.key != e).unwrap_or(true))
             .cloned()
             .take(max)
-            .sorted_by_key(|e| self.me.distance(&e))
+            .sorted_by_key(|e| self.key.distance(&e.key))
             .collect()
     }
 
@@ -155,7 +156,7 @@ impl<'b, N: KeyLen> Iterator for TableIter<'b, N> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Bucket<N: KeyLen> {
     inner: Vec<Node<N>>,
     queue: Vec<Node<N>>,
@@ -234,8 +235,8 @@ impl<N: KeyLen> Bucket<N> {
     }
 
     #[inline(always)]
-    fn in_range(&self, node: &Node<N>) -> bool {
-        let big_uint = node.key.to_biguint().unwrap();
+    fn in_range(&self, key: &Key<N>) -> bool {
+        let big_uint = key.to_biguint().unwrap();
         self.range.contains(&big_uint)
     }
 

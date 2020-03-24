@@ -1,8 +1,9 @@
 use crate::{message, Error, Key, KeyLen, Result};
+use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-#[derive(Clone, Eq, PartialEq, Hash)]
+#[derive(Clone, Eq, PartialEq, Hash, Deserialize, Serialize)]
 pub struct Node<N: KeyLen> {
     pub key: Key<N>,
     pub address: SocketAddr,

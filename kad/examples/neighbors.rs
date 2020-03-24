@@ -91,7 +91,7 @@ fn main() {
 
     let nodes = gen_nodes(node_count);
 
-    let mut table = Table::new(me.clone(), 16);
+    let mut table = Table::new(me.key.clone(), 16);
     nodes.iter().for_each(|n| {
         table.add(n);
     });

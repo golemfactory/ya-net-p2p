@@ -2,6 +2,7 @@ use crate::Error;
 use generic_array::sequence::GenericSequence;
 use generic_array::{ArrayLength, GenericArray};
 use num_bigint::{BigUint, RandBigInt, ToBigUint};
+use serde::{Deserialize, Serialize};
 use std::cmp::{max, min};
 use std::convert::TryFrom;
 use std::hash::Hash;
@@ -16,7 +17,7 @@ lazy_static::lazy_static! {
 pub trait KeyLen: ArrayLength<u8> + Unpin + Clone + Ord + Hash {}
 impl<L> KeyLen for L where L: ArrayLength<u8> + Unpin + Clone + Ord + Hash {}
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct Key<N: KeyLen> {
     inner: GenericArray<u8, N>,
 }
