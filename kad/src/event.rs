@@ -1,10 +1,12 @@
 use crate::{message, Key, KeyLen, Node, Result};
 use actix::Message;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 
 #[derive(Clone, Debug, Message, Deserialize, Serialize)]
 #[rtype(result = "()")]
 pub struct KadEvtSend<N: KeyLen> {
+    pub from: Node<N>,
     pub to: Node<N>,
     pub message: KadMessage,
 }
@@ -34,18 +36,62 @@ pub struct KadEvtFindValue {
 #[rtype(result = "Result<()>")]
 pub struct KadEvtBootstrap<N: KeyLen> {
     pub nodes: Vec<Node<N>>,
+    pub dormant: bool,
 }
 
-#[derive(Clone, Debug, Message, Deserialize, Serialize)]
-#[rtype(result = "()")]
-pub enum KadMessage {
-    Ping(message::Ping),
-    Pong(message::Pong),
-    Store(message::Store),
-    FindNode(message::FindNode),
-    FindNodeResult(message::FindNodeResult),
-    FindValue(message::FindValue),
-    FindValueResult(message::FindValueResult),
+macro_rules! kad_message {
+    ( $($ident:ident),* ) => {
+        #[derive(Clone, Debug, Message, Deserialize, Serialize)]
+        #[rtype(result = "()")]
+        pub enum KadMessage {
+            $(
+                $ident(message::$ident),
+            )*
+        }
+
+        impl KadMessage {
+            pub fn rand_val(&self) -> u32 {
+                match &self {
+                    $(
+                        KadMessage::$ident(m) => m.rand_val,
+                    )*
+                }
+            }
+        }
+
+        impl std::fmt::Display for KadMessage {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match &self {
+                    $(
+                        KadMessage::$ident(_) => f.write_fmt(format_args!(
+                            "{} (rand_val: {:<10})",
+                            stringify!($ident),
+                            self.rand_val(),
+                        )),
+                    )*
+                }
+            }
+        }
+
+        $(
+            impl From<message::$ident> for KadMessage {
+                #[inline(always)]
+                fn from(msg: message::$ident) -> Self {
+                    KadMessage::$ident(msg)
+                }
+            }
+        )*
+    };
+}
+
+kad_message! {
+    Ping,
+    Pong,
+    Store,
+    FindNode,
+    FindNodeResult,
+    FindValue,
+    FindValueResult
 }
 
 impl KadMessage {
@@ -59,10 +105,6 @@ impl KadMessage {
         }
     }
 
-    pub fn is_response(&self) -> bool {
-        !self.is_request()
-    }
-
     pub fn searched_key(&self) -> Option<Vec<u8>> {
         match &self {
             KadMessage::FindNode(m) => Some(m.key.clone()),
@@ -70,18 +112,12 @@ impl KadMessage {
             _ => None,
         }
     }
+}
 
-    pub fn rand_val(&self) -> u32 {
-        match &self {
-            KadMessage::Ping(m) => m.rand_val,
-            KadMessage::Pong(m) => m.rand_val,
-            KadMessage::Store(m) => m.rand_val,
-            KadMessage::FindNode(m) => m.rand_val,
-            KadMessage::FindNodeResult(m) => m.rand_val,
-            KadMessage::FindValue(m) => m.rand_val,
-            KadMessage::FindValueResult(m) => m.rand_val,
-        }
-    }
+#[derive(Clone, Debug, Message)]
+#[rtype(result = "Result<()>")]
+pub(crate) struct EvtAddressChanged {
+    pub address: SocketAddr,
 }
 
 #[derive(Clone, Debug, Message)]
@@ -94,14 +130,5 @@ pub(crate) struct EvtSend<N: KeyLen> {
 impl<N: KeyLen> EvtSend<N> {
     pub fn new(to: Node<N>, message: KadMessage) -> Self {
         Self { to, message }
-    }
-}
-
-impl<N: KeyLen> From<EvtSend<N>> for KadEvtSend<N> {
-    fn from(evt: EvtSend<N>) -> Self {
-        Self {
-            to: evt.to,
-            message: evt.message,
-        }
     }
 }

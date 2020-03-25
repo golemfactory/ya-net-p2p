@@ -38,12 +38,13 @@ where
     N: KeyLen + Unpin + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
-    tx: mpsc::Sender<KadEvtSend<N>>,
-    me: Rc<Node<N>>,
+    me: Node<N>,
     table: Table<N>,
     storage: HashMap<Vec<u8>, (message::Value, i64)>,
     lookups: HashMap<Vec<u8>, (Lookup<N>, i64)>,
     requests: HashMap<u32, (KadMessage, i64)>,
+    name: String,
+    tx: mpsc::Sender<KadEvtSend<N>>,
 }
 
 impl<N> Kad<N>
@@ -51,15 +52,20 @@ where
     N: KeyLen + Unpin + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
-    pub fn new(me: Rc<Node<N>>, tx: mpsc::Sender<KadEvtSend<N>>) -> Self {
+    pub fn new(me: Node<N>, tx: mpsc::Sender<KadEvtSend<N>>) -> Self {
+        Self::with_name("Kad", me, tx)
+    }
+
+    pub fn with_name(name: impl ToString, me: Node<N>, tx: mpsc::Sender<KadEvtSend<N>>) -> Self {
         let key = me.key.clone();
         Self {
-            tx,
             me,
             table: Table::new(key, K),
             storage: HashMap::new(),
             lookups: HashMap::new(),
             requests: HashMap::new(),
+            name: name.to_string(),
+            tx,
         }
     }
 
@@ -115,7 +121,7 @@ where
             if limit.map(|l| l == nodes.len()).unwrap_or(false) {
                 nodes.remove(0);
             }
-            nodes.push((*self.me).clone());
+            nodes.push(self.me.clone());
         }
         nodes
     }
@@ -194,6 +200,8 @@ where
         IntervalFunc::new(*REQUEST_UPKEEP_INTERVAL, Self::request_upkeep)
             .finish()
             .spawn(ctx);
+
+        log::debug!("{} ({}) service started", self.name, self.me.key);
     }
 }
 
@@ -208,20 +216,29 @@ where
         let address = ctx.address();
         let my_key = self.me.key.as_ref().to_vec();
 
+        log::debug!("{}: bootstrapping", self.name);
+
         msg.nodes.iter().for_each(|node| {
             self.table.add(&node);
         });
 
-        let fut = async move {
-            let mut rng = rand::thread_rng();
-            for to in msg.nodes {
-                let message = KadMessage::FindNode(message::FindNode {
-                    rand_val: rng.next_u32(),
-                    key: my_key.clone(),
-                });
-                let _ = address.send(EvtSend { to, message }).await;
+        let fut = match msg.dormant {
+            true => async move { Ok(()) }.left_future(),
+            false => async move {
+                let mut rng = rand::thread_rng();
+                for to in msg.nodes {
+                    let message = KadMessage::from(message::FindNode {
+                        rand_val: rng.next_u32(),
+                        key: my_key.clone(),
+                    });
+
+                    if let Err(e) = address.send(EvtSend::new(to, message)).await {
+                        log::error!("Unable to send message: {:?}", e);
+                    }
+                }
+                Ok(())
             }
-            Ok(())
+            .right_future(),
         };
 
         ActorResponse::r#async(fut.into_actor(self))
@@ -239,10 +256,15 @@ where
         let address = ctx.address();
         let (from, _new, msg) = (evt.from, evt.new, evt.message);
 
+        log::debug!("{} rx {} from {}", self.name, msg, from);
+
         let msg_opt = if !self.table.add(&from) {
-            Some(KadMessage::Ping(message::Ping {
-                rand_val: rand::thread_rng().next_u32(),
-            }))
+            match &msg {
+                KadMessage::Ping(_) | KadMessage::Pong(_) => None,
+                _ => Some(KadMessage::from(message::Ping {
+                    rand_val: rand::thread_rng().next_u32(),
+                })),
+            }
         // TODO: } else if new { transfer_values(..)
         } else {
             None
@@ -282,7 +304,7 @@ where
     #[inline]
     fn handle_ping(&mut self, msg: message::Ping) -> impl Future<Output = HandleMsgResult> {
         async move {
-            Ok(Some(KadMessage::Pong(message::Pong {
+            Ok(Some(KadMessage::from(message::Pong {
                 rand_val: msg.rand_val,
             })))
         }
@@ -329,7 +351,7 @@ where
         };
 
         async move {
-            Ok(Some(KadMessage::FindNodeResult(message::FindNodeResult {
+            Ok(Some(KadMessage::from(message::FindNodeResult {
                 rand_val,
                 nodes: nodes.into_iter().map(Node::into).collect(),
             })))
@@ -352,6 +374,12 @@ where
 
         match self.find_lookup(msg.rand_val) {
             Ok(mut lookup) => {
+                log::debug!(
+                    "{} received nodes for node lookup: {}",
+                    self.name,
+                    Key::<N>::fmt_key(&lookup.key),
+                );
+
                 let node_idx = nodes
                     .iter()
                     .take(K)
@@ -365,7 +393,8 @@ where
             }
             Err(error) => match error {
                 Error::InvalidLookup(_) => {
-                    log::debug!("{:?}", error);
+                    log::debug!("{} received nodes ({})", self.name, nodes.len());
+
                     nodes.into_iter().for_each(|n| {
                         self.table.add(&n);
                     });
@@ -405,7 +434,7 @@ where
             },
         };
 
-        async move { Ok(Some(KadMessage::FindValueResult(reply))) }.right_future()
+        async move { Ok(Some(KadMessage::from(reply))) }.right_future()
     }
 
     #[inline]
@@ -426,6 +455,12 @@ where
 
         match result {
             message::find_value_result::Result::Nodes(res) => {
+                log::debug!(
+                    "{} received nodes for value lookup: {:?}",
+                    self.name,
+                    lookup.key
+                );
+
                 let nodes = res
                     .nodes
                     .into_iter()
@@ -435,6 +470,12 @@ where
                 lookup.feed(from, nodes);
             }
             message::find_value_result::Result::Value(res) => {
+                log::debug!(
+                    "{} received value for value lookup: {:?}",
+                    self.name,
+                    lookup.key
+                );
+
                 lookup.finish(LookupValue::Value(res.value));
             }
         }
@@ -451,6 +492,8 @@ where
     type Result = ActorResponse<Self, Option<Node<N>>, Error>;
 
     fn handle(&mut self, msg: KadEvtFindNode<N>, ctx: &mut Context<Self>) -> Self::Result {
+        log::debug!("{} received a find node request: {}", self.name, msg.key);
+
         if let Some(node) = self.table.get(&msg.key) {
             return ActorResponse::reply(Ok(Some(node.clone())));
         }
@@ -476,6 +519,8 @@ where
     type Result = ActorResponse<Self, Option<(Vec<u8>, Vec<u8>)>, Error>;
 
     fn handle(&mut self, msg: KadEvtFindValue, ctx: &mut Context<Self>) -> Self::Result {
+        log::debug!("{} received a find value request: {:?}", self.name, msg.key);
+
         if let Some(msg_value) = self.find_value(&msg.key) {
             return ActorResponse::reply(Ok(Some((msg.key, msg_value.value.clone()))));
         }
@@ -505,6 +550,8 @@ where
     type Result = ActorResponse<Self, (), Error>;
 
     fn handle(&mut self, evt: EvtSend<N>, _: &mut Context<Self>) -> Self::Result {
+        log::debug!("{} tx {} to {}", self.name, evt.message, evt.to);
+
         if evt.message.is_request() {
             self.requests.insert(
                 evt.message.rand_val(),
@@ -512,9 +559,40 @@ where
             );
         }
 
+        let me = self.me.clone();
         let mut tx = self.tx.clone();
-        let fut = async move { tx.send(KadEvtSend::from(evt)).await.map_err(Error::from) };
+
+        let fut = async move {
+            tx.send(KadEvtSend {
+                from: me,
+                to: evt.to,
+                message: evt.message,
+            })
+            .await
+            .map_err(Error::from)
+        };
+
         ActorResponse::r#async(fut.into_actor(self))
+    }
+}
+
+impl<N> Handler<EvtAddressChanged> for Kad<N>
+where
+    N: KeyLen + Unpin + 'static,
+    <N as ArrayLength<u8>>::ArrayType: Unpin,
+{
+    type Result = <EvtAddressChanged as Message>::Result;
+
+    fn handle(&mut self, evt: EvtAddressChanged, _: &mut Context<Self>) -> Self::Result {
+        log::debug!(
+            "{} address changed from {:?} to {:?}",
+            self.name,
+            self.me.address,
+            evt.address
+        );
+
+        std::mem::replace(&mut self.me.address, evt.address);
+        Ok(())
     }
 }
 
@@ -610,16 +688,19 @@ where
             for to in nodes.into_iter() {
                 let rand_val = rand::thread_rng().next_u32();
                 let message = match &key {
-                    LookupKey::Node(key) => KadMessage::FindNode(message::FindNode {
+                    LookupKey::Node(key) => KadMessage::from(message::FindNode {
                         rand_val,
                         key: key.clone(),
                     }),
-                    LookupKey::Value(key) => KadMessage::FindValue(message::FindValue {
+                    LookupKey::Value(key) => KadMessage::from(message::FindValue {
                         rand_val,
                         key: key.clone(),
                     }),
                 };
-                let _ = address.send(EvtSend { to, message }).await;
+
+                if let Err(e) = address.send(EvtSend { to, message }).await {
+                    log::error!("Unable to send lookup message: {:?}", e);
+                }
             }
         });
     }

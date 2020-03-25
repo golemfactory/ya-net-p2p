@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-#[derive(Clone, Eq, PartialEq, Hash, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize)]
 pub struct Node<N: KeyLen> {
     pub key: Key<N>,
     pub address: SocketAddr,
@@ -16,12 +16,11 @@ impl<N: KeyLen> Node<N> {
     }
 }
 
-impl<N: KeyLen> std::fmt::Debug for Node<N> {
+impl<N: KeyLen> std::fmt::Display for Node<N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!(
             "Node {{ key: {}, address: {:?} }}",
-            hex::encode(&self.key),
-            self.address
+            self.key, self.address
         ))
     }
 }

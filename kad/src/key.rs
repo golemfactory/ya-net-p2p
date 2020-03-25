@@ -73,10 +73,29 @@ impl<N: KeyLen> Key<N> {
     }
 }
 
+impl<N: KeyLen> Key<N> {
+    #[inline]
+    pub fn fmt_key<K: AsRef<[u8]>>(key: K) -> String {
+        let r = key.as_ref();
+        let n = min(8 * 2, r.len()) / 2;
+        format!(
+            "{}..{}",
+            hex::encode(&r[..n]),
+            hex::encode(&r[r.len() - n..]),
+        )
+    }
+}
+
 impl<N: KeyLen> AsRef<[u8]> for Key<N> {
     #[inline]
     fn as_ref(&self) -> &[u8] {
         self.inner.as_ref()
+    }
+}
+
+impl<N: KeyLen> std::fmt::Display for Key<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&Self::fmt_key(self))
     }
 }
 
