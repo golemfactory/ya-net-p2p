@@ -36,7 +36,6 @@ pub struct KadEvtFindValue {
 #[rtype(result = "Result<()>")]
 pub struct KadEvtBootstrap<N: KeyLen> {
     pub nodes: Vec<Node<N>>,
-    pub dormant: bool,
 }
 
 macro_rules! kad_message {
@@ -97,10 +96,7 @@ kad_message! {
 impl KadMessage {
     pub fn is_request(&self) -> bool {
         match &self {
-            KadMessage::Ping(_)
-            | KadMessage::Store(_)
-            | KadMessage::FindValue(_)
-            | KadMessage::FindNode(_) => true,
+            KadMessage::Ping(_) | KadMessage::FindValue(_) | KadMessage::FindNode(_) => true,
             _ => false,
         }
     }

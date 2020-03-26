@@ -1,18 +1,12 @@
 use crate::Error;
 use generic_array::sequence::GenericSequence;
 use generic_array::{ArrayLength, GenericArray};
-use num_bigint::{BigUint, RandBigInt, ToBigUint};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::cmp::{max, min};
+use std::cmp::min;
 use std::convert::TryFrom;
 use std::hash::Hash;
 use std::iter::FromIterator;
-use std::ops::Range;
-
-lazy_static::lazy_static! {
-    static ref BIG_UINT_ONE: BigUint = 1_u32.to_biguint().unwrap();
-    static ref BIG_UINT_TWO: BigUint = 2_u32.to_biguint().unwrap();
-}
 
 pub trait KeyLen: ArrayLength<u8> + Unpin + Clone + Ord + Hash {}
 impl<L> KeyLen for L where L: ArrayLength<u8> + Unpin + Clone + Ord + Hash {}
@@ -23,24 +17,26 @@ pub struct Key<N: KeyLen> {
 }
 
 impl<N: KeyLen> Key<N> {
-    pub fn range() -> Range<BigUint> {
-        let max_bytes = (0..N::to_usize()).map(|_| 0xff).collect::<Vec<u8>>();
-        let max = BigUint::from_bytes_be(&max_bytes);
+    pub fn random(leading_zeros: usize) -> Self {
+        let mut rng = rand::thread_rng();
 
-        Range {
-            start: BigUint::from(0u64),
-            end: max + &*BIG_UINT_ONE,
-        }
-    }
+        let n = N::to_usize();
+        let z = leading_zeros / 8;
+        let x = (rng.gen::<u8>() >> (leading_zeros % 8) as u8)
+            | 1u8 << (8 - 1 - (leading_zeros % 8)) as u8;
 
-    pub fn random(range: &Range<BigUint>) -> Self {
-        let self_range = Self::range();
-        let big = rand::thread_rng().gen_biguint_range(
-            max(&self_range.start, &range.start),
-            min(&self_range.end, &range.end),
-        );
+        let inner = if z >= n {
+            GenericArray::<u8, N>::from_iter(std::iter::repeat(0u8).take(n))
+        } else {
+            GenericArray::<u8, N>::from_iter(
+                std::iter::repeat(0u8)
+                    .take(z)
+                    .chain(std::iter::once(x))
+                    .chain((0..(n - z - 1)).map(|_| rng.gen::<u8>())),
+            )
+        };
 
-        Self::try_from(big.to_bytes_be()).unwrap()
+        Self { inner }
     }
 
     #[inline]
@@ -52,23 +48,38 @@ impl<N: KeyLen> Key<N> {
 
     pub fn distance<O: AsRef<[u8]>>(&self, other: &O) -> Self {
         let other = other.as_ref();
-        let other_len = other.len();
-        let len = N::to_usize();
-        let diff = if other_len > len {
+        let l = other.len();
+        let n = N::to_usize();
+        let d = if l > n {
             return Self {
                 inner: GenericArray::<u8, N>::generate(|_| 0xff),
             };
         } else {
-            len - other_len
+            n - l
         };
 
         Self {
             inner: GenericArray::<u8, N>::from_iter(
                 self.inner
                     .iter()
-                    .zip(std::iter::repeat(&0u8).take(diff).chain(other.iter()))
+                    .zip(std::iter::repeat(&0u8).take(d).chain(other.iter()))
                     .map(|(f, s)| f ^ s),
             ),
+        }
+    }
+
+    pub fn leading_zeros(&self) -> usize {
+        let result = self.inner.iter().try_fold(0 as usize, |acc, b| {
+            if acc % 8 == 0 {
+                Ok(acc + b.leading_zeros() as usize)
+            } else {
+                Err(acc)
+            }
+        });
+
+        match result {
+            Ok(v) => v,
+            Err(v) => v,
         }
     }
 }
@@ -77,7 +88,7 @@ impl<N: KeyLen> Key<N> {
     #[inline]
     pub fn fmt_key<K: AsRef<[u8]>>(key: K) -> String {
         let r = key.as_ref();
-        let n = min(8 * 2, r.len()) / 2;
+        let n = min(8, r.len() / 2);
         format!(
             "{}..{}",
             hex::encode(&r[..n]),
@@ -103,47 +114,18 @@ impl<N: KeyLen> TryFrom<Vec<u8>> for Key<N> {
     type Error = Error;
 
     fn try_from(other: Vec<u8>) -> Result<Self, Self::Error> {
-        let other_len = other.len();
-        let len = N::to_usize();
-        let diff = if other_len > len {
-            return Err(Error::InvalidKeyLength(other_len));
+        let l = other.len();
+        let n = N::to_usize();
+        let d = if l > n {
+            return Err(Error::InvalidKeyLength(l));
         } else {
-            len - other_len
+            n - l
         };
 
         Ok(Key {
             inner: GenericArray::<u8, N>::from_iter(
-                std::iter::repeat(0u8).take(diff).chain(other.into_iter()),
+                std::iter::repeat(0u8).take(d).chain(other.into_iter()),
             ),
         })
-    }
-}
-
-impl<N: KeyLen> ToBigUint for Key<N> {
-    fn to_biguint(&self) -> Option<BigUint> {
-        Some(BigUint::from_bytes_be(&self.inner))
-    }
-}
-
-pub(crate) trait RangeOps<T> {
-    fn split(&self) -> (Range<T>, Range<T>);
-}
-
-impl RangeOps<BigUint> for Range<BigUint> {
-    fn split(&self) -> (Range<BigUint>, Range<BigUint>) {
-        let start = &self.start;
-        let end = &self.end;
-        let mid = end - ((end - start) / &*BIG_UINT_TWO);
-
-        (
-            Range {
-                start: start.clone(),
-                end: mid.clone(),
-            },
-            Range {
-                start: mid.clone(),
-                end: end.clone() + &*BIG_UINT_ONE,
-            },
-        )
     }
 }

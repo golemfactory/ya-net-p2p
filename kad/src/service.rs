@@ -25,12 +25,12 @@ const MAX_KEY_SZ: usize = 33;
 const MAX_VAL_SZ: usize = 65535;
 const MAX_VAL_TTL: u32 = 604800;
 const MAX_REQ_TTL: i64 = 5;
-const MAX_LOOKUP_TTL: i64 = 300;
+const MAX_LOOKUP_TTL: i64 = 60;
 
 lazy_static::lazy_static! {
     static ref REQUEST_UPKEEP_INTERVAL: Duration = Duration::from_secs(2);
     static ref STORAGE_UPKEEP_INTERVAL: Duration = Duration::from_secs(60);
-    static ref LOOKUP_UPKEEP_INTERVAL: Duration = Duration::from_secs(2);
+    static ref LOOKUP_UPKEEP_INTERVAL: Duration = Duration::from_secs(1);
 }
 
 pub struct Kad<N>
@@ -42,7 +42,7 @@ where
     table: Table<N>,
     storage: HashMap<Vec<u8>, (message::Value, i64)>,
     lookups: HashMap<Vec<u8>, (Lookup<N>, i64)>,
-    requests: HashMap<u32, (KadMessage, i64)>,
+    requests: HashMap<u32, (KadMessage, Key<N>, i64)>,
     name: String,
     tx: mpsc::Sender<KadEvtSend<N>>,
 }
@@ -73,7 +73,7 @@ where
         self.table
             .stale_buckets()
             .into_iter()
-            .map(|b| Key::<N>::random(&b.range))
+            .filter_map(|b| b.oldest().map(|n| n.key.clone()))
             .collect()
     }
 
@@ -86,9 +86,19 @@ where
 
     #[inline]
     fn request_upkeep(&mut self, _: &mut Context<Self>) {
+        let mut to_remove = HashSet::new();
         let now = Utc::now().timestamp();
-        self.requests
-            .retain(|_, (_, created_at)| now - *created_at < MAX_REQ_TTL);
+
+        self.requests.retain(|_, (_, key, created_at)| {
+            if now - *created_at < MAX_REQ_TTL {
+                true
+            } else {
+                to_remove.insert(key.clone());
+                false
+            }
+        });
+
+        to_remove.iter().for_each(|k| self.table.remove(k));
     }
 
     #[inline]
@@ -119,9 +129,9 @@ where
         let mut nodes = self.table.neighbors(&key, excluded, limit);
         if key == &self.me.key {
             if limit.map(|l| l == nodes.len()).unwrap_or(false) {
-                nodes.remove(0);
+                nodes.remove(nodes.len() - 1);
             }
-            nodes.push(self.me.clone());
+            nodes.insert(0, self.me.clone());
         }
         nodes
     }
@@ -139,11 +149,11 @@ where
         None
     }
 
-    fn find_lookup(&self, rand_val: u32) -> Result<Lookup<N>> {
+    fn find_lookup(&mut self, rand_val: u32) -> Result<Lookup<N>> {
         let key_opt = self
             .requests
-            .get(&rand_val)
-            .map(|(m, _)| m.searched_key())
+            .remove(&rand_val)
+            .map(|(m, _, _)| m.searched_key())
             .flatten();
 
         let key = match key_opt {
@@ -168,7 +178,7 @@ where
         }
 
         let nodes = self.find_node(node_key, None, Some(K));
-        let lookup = self
+        let mut lookup = self
             .lookups
             .entry(lookup_key.as_ref().to_vec())
             .or_insert((
@@ -213,32 +223,28 @@ where
     type Result = ActorResponse<Self, (), Error>;
 
     fn handle(&mut self, msg: KadEvtBootstrap<N>, ctx: &mut Context<Self>) -> Self::Result {
+        log::debug!("{}: bootstrapping", self.name);
+
         let address = ctx.address();
         let my_key = self.me.key.as_ref().to_vec();
 
-        log::debug!("{}: bootstrapping", self.name);
-
         msg.nodes.iter().for_each(|node| {
-            self.table.add(&node);
+            self.table.add(node);
         });
 
-        let fut = match msg.dormant {
-            true => async move { Ok(()) }.left_future(),
-            false => async move {
-                let mut rng = rand::thread_rng();
-                for to in msg.nodes {
-                    let message = KadMessage::from(message::FindNode {
-                        rand_val: rng.next_u32(),
-                        key: my_key.clone(),
-                    });
+        let fut = async move {
+            let mut rng = rand::thread_rng();
+            for to in msg.nodes {
+                let message = KadMessage::from(message::FindNode {
+                    rand_val: rng.next_u32(),
+                    key: my_key.clone(),
+                });
 
-                    if let Err(e) = address.send(EvtSend::new(to, message)).await {
-                        log::error!("Unable to send message: {:?}", e);
-                    }
+                if let Err(e) = address.send(EvtSend::new(to, message)).await {
+                    log::error!("Unable to send message: {:?}", e);
                 }
-                Ok(())
             }
-            .right_future(),
+            Ok(())
         };
 
         ActorResponse::r#async(fut.into_actor(self))
@@ -253,18 +259,28 @@ where
     type Result = ActorResponse<Self, (), Error>;
 
     fn handle(&mut self, evt: KadEvtReceive<N>, ctx: &mut Context<Self>) -> Self::Result {
+        log::debug!("{} rx {} from {}", self.name, evt.message, evt.from);
+
         let address = ctx.address();
         let (from, _new, msg) = (evt.from, evt.new, evt.message);
 
-        log::debug!("{} rx {} from {}", self.name, msg, from);
-
-        let msg_opt = if !self.table.add(&from) {
-            match &msg {
-                KadMessage::Ping(_) | KadMessage::Pong(_) => None,
-                _ => Some(KadMessage::from(message::Ping {
-                    rand_val: rand::thread_rng().next_u32(),
-                })),
-            }
+        let evt_opt = if !self.table.add(&from) {
+            // match self.table.bucket_oldest(&from.key) {
+            //     Some(node) => {
+            //         if from.key != node.key {
+            //             Some(EvtSend::new(
+            //                 node,
+            //                 KadMessage::from(message::Ping {
+            //                     rand_val: rand::thread_rng().next_u32(),
+            //                 }),
+            //             ))
+            //         } else {
+            //             None
+            //         }
+            //     }
+            //     _ => None,
+            // }
+            Option::<EvtSend<N>>::None
         // TODO: } else if new { transfer_values(..)
         } else {
             None
@@ -277,15 +293,15 @@ where
             KadMessage::FindValueResult(m) => self.handle_value_result(m, &from.key).boxed_local(),
             KadMessage::Store(m) => self.handle_store(m).boxed_local(),
             KadMessage::Ping(m) => self.handle_ping(m).boxed_local(),
-            _ => async move { Ok(None) }.boxed_local(),
+            KadMessage::Pong(m) => self.handle_pong(m).boxed_local(),
         };
 
         let fut = async move {
-            if let Some(m) = msg_opt {
-                address.send(EvtSend::new(from.clone(), m)).await??;
+            if let Some(evt) = evt_opt {
+                address.send(evt).await??;
             }
-            if let Some(m) = handler_fut.await? {
-                address.send(EvtSend::new(from, m)).await??;
+            if let Some(msg) = handler_fut.await? {
+                address.send(EvtSend::new(from, msg)).await??;
             }
             Ok(())
         };
@@ -308,6 +324,12 @@ where
                 rand_val: msg.rand_val,
             })))
         }
+    }
+
+    #[inline]
+    fn handle_pong(&mut self, msg: message::Pong) -> impl Future<Output = HandleMsgResult> {
+        self.requests.remove(&msg.rand_val);
+        async move { Ok(None) }
     }
 
     #[inline]
@@ -346,7 +368,7 @@ where
     ) -> impl Future<Output = HandleMsgResult> {
         let rand_val = msg.rand_val;
         let nodes = match Key::<N>::try_from(msg.key) {
-            Ok(key) => self.find_node(&key, Some(from), Some(self.table.k)),
+            Ok(key) => self.find_node(&key, Some(from), Some(self.table.bucket_size)),
             Err(error) => return error.fut().left_future(),
         };
 
@@ -365,6 +387,7 @@ where
         msg: message::FindNodeResult,
         from: &Key<N>,
     ) -> impl Future<Output = HandleMsgResult> {
+        let fut = async move { Ok(None) }.right_future();
         let nodes = msg
             .nodes
             .into_iter()
@@ -374,9 +397,19 @@ where
 
         match self.find_lookup(msg.rand_val) {
             Ok(mut lookup) => {
+                if !lookup.in_progress() {
+                    log::debug!(
+                        "{}: handle_node_result: lookup {} already finished",
+                        self.name,
+                        Key::<N>::fmt_key(lookup.key)
+                    );
+                    return fut;
+                }
+
                 log::debug!(
-                    "{} received nodes for node lookup: {}",
+                    "{} received nodes ({}) for node lookup: {}",
                     self.name,
+                    nodes.len(),
                     Key::<N>::fmt_key(&lookup.key),
                 );
 
@@ -394,16 +427,17 @@ where
             Err(error) => match error {
                 Error::InvalidLookup(_) => {
                     log::debug!("{} received nodes ({})", self.name, nodes.len());
-
-                    nodes.into_iter().for_each(|n| {
-                        self.table.add(&n);
+                    nodes.iter().for_each(|node| {
+                        self.table.add(node);
                     });
                 }
-                _ => return error.fut().left_future(),
+                _ => {
+                    return error.fut().left_future();
+                }
             },
         };
 
-        async move { Ok(None) }.right_future()
+        fut
     }
 
     #[inline]
@@ -424,7 +458,7 @@ where
                     rand_val: msg.rand_val,
                     result: Some(Response::Nodes(message::Nodes {
                         nodes: self
-                            .find_node(&key, Some(from), Some(self.table.k))
+                            .find_node(&key, Some(from), Some(self.table.bucket_size))
                             .into_iter()
                             .map(Node::into)
                             .collect(),
@@ -443,10 +477,17 @@ where
         msg: message::FindValueResult,
         from: &Key<N>,
     ) -> impl Future<Output = HandleMsgResult> {
+        let fut = async move { Ok(None) }.right_future();
         let mut lookup = match self.find_lookup(msg.rand_val) {
             Ok(lookup) => lookup,
             Err(error) => return error.fut().left_future(),
         };
+
+        if !lookup.in_progress() {
+            return fut;
+        }
+
+        lookup.key_backlog.insert(from.clone());
 
         let result = match msg.result {
             Some(result) => result,
@@ -467,6 +508,7 @@ where
                     .map(Node::<N>::try_from)
                     .filter_map(Result::ok)
                     .collect::<Vec<_>>();
+
                 lookup.feed(from, nodes);
             }
             message::find_value_result::Result::Value(res) => {
@@ -480,7 +522,7 @@ where
             }
         }
 
-        async move { Ok(None) }.right_future()
+        fut
     }
 }
 
@@ -550,12 +592,17 @@ where
     type Result = ActorResponse<Self, (), Error>;
 
     fn handle(&mut self, evt: EvtSend<N>, _: &mut Context<Self>) -> Self::Result {
+        // Transform port for non-UDP, fixed-port operating mode?
         log::debug!("{} tx {} to {}", self.name, evt.message, evt.to);
 
         if evt.message.is_request() {
             self.requests.insert(
                 evt.message.rand_val(),
-                (evt.message.clone(), Utc::now().timestamp()),
+                (
+                    evt.message.clone(),
+                    evt.to.key.clone(),
+                    Utc::now().timestamp(),
+                ),
             );
         }
 
@@ -603,6 +650,7 @@ where
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     key: LookupKey,
+    key_backlog: HashSet<Key<N>>,
     kad: Addr<Kad<N>>,
     state: Rc<RefCell<LookupState<N>>>,
     waker: Option<Waker>,
@@ -619,6 +667,7 @@ where
             key,
             kad,
             state,
+            key_backlog: HashSet::new(),
             waker: None,
         }
     }
@@ -642,14 +691,16 @@ where
             *candidates = std::mem::replace(candidates, Vec::new())
                 .into_iter()
                 .chain(nodes.into_iter())
+                .filter(|n| !self.key_backlog.contains(&n.key) && !pending.contains(&n.key))
+                .unique()
                 .sorted_by_key(|n| n.key.distance(&self.key))
-                .take(K)
+                // .take(K)
                 .collect();
         }
     }
 
     pub fn iterate(&mut self) {
-        let mut finish = false;
+        let mut send_out_nodes = None;
 
         if let LookupState::InProgress {
             started_at,
@@ -667,22 +718,24 @@ where
                 *pending = nodes.iter().map(|n| n.key.clone()).collect();
                 *started_at = Utc::now().timestamp();
 
-                if nodes.is_empty() {
-                    finish = true;
-                } else {
-                    self.send_out(nodes);
-                }
+                send_out_nodes = Some(nodes)
             }
         }
 
-        if finish {
-            self.finish(LookupValue::None);
+        if let Some(nodes) = send_out_nodes {
+            if nodes.is_empty() {
+                self.finish(LookupValue::None);
+            } else {
+                self.send_out(nodes);
+            }
         }
     }
 
-    pub fn send_out(&self, nodes: Vec<Node<N>>) {
+    pub fn send_out(&mut self, nodes: Vec<Node<N>>) {
         let address = self.kad.clone();
         let key = self.key.clone();
+
+        self.key_backlog.extend(nodes.iter().map(|n| n.key.clone()));
 
         actix_rt::spawn(async move {
             for to in nodes.into_iter() {

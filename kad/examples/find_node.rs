@@ -1,7 +1,7 @@
 use actix::prelude::*;
 use futures::channel::mpsc;
 use futures::StreamExt;
-use generic_array::typenum::U512;
+use generic_array::typenum::U64;
 use rand::distributions::{Distribution, Uniform};
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
@@ -12,7 +12,7 @@ use structopt::StructOpt;
 use tokio::time::delay_for;
 use ya_net_kad::{Error, KadEvtBootstrap, KadEvtFindNode, KadEvtReceive, KadEvtSend};
 
-type Size = U512;
+type Size = U64;
 
 type Key = ya_net_kad::Key<Size>;
 type Node = ya_net_kad::Node<Size>;
@@ -93,7 +93,7 @@ fn spawn_nodes(
         })
         .collect::<HashMap<_, _>>();
 
-    log::info!("Total nodes: {}", nodes.len());
+    log::info!("Nodes: {}", nodes.len());
     log::info!("Bootstrap nodes: {}", boot.len());
 
     let nodes = nodes
@@ -119,27 +119,28 @@ async fn bootstrap(
     boot: &HashMap<Node, Addr<Kad>>,
     nodes: &HashMap<Node, Addr<Kad>>,
 ) -> Result<(), Error> {
-    let delay = Duration::from_millis(5);
+    let delay = Duration::from_millis(25);
     let init_vec = boot.iter().map(|(n, _)| n).cloned().collect::<Vec<_>>();
 
-    for (node, addr) in nodes.iter() {
-        log::info!("Bootstrapping {}", node);
+    for _ in 0..2 {
+        for (node, addr) in nodes.iter() {
+            log::info!("Bootstrapping {}", node);
 
-        addr.send(KadEvtBootstrap {
-            nodes: init_vec.clone(),
-            dormant: false,
-        })
-        .await??;
+            addr.send(KadEvtBootstrap {
+                nodes: init_vec.clone(),
+            })
+            .await??;
 
-        delay_for(delay).await;
+            delay_for(delay).await;
+        }
     }
 
     Ok(())
 }
 
 async fn find_node(nodes: &HashMap<Node, Addr<Kad>>) -> Result<Option<Node>, Error> {
-    let mut first;
-    let mut second;
+    let mut searcher;
+    let mut to_find;
     let mut rng = rand::thread_rng();
 
     loop {
@@ -147,20 +148,20 @@ async fn find_node(nodes: &HashMap<Node, Addr<Kad>>) -> Result<Option<Node>, Err
         let first_idx = dist.sample(&mut rng);
         let second_idx = dist.sample(&mut rng);
 
-        first = nodes.iter().skip(first_idx).next().unwrap();
-        second = nodes.iter().skip(second_idx).next().unwrap();
+        searcher = nodes.iter().skip(first_idx).next().unwrap();
+        to_find = nodes.iter().skip(second_idx).next().unwrap();
 
-        if first != second {
+        if searcher != to_find {
             break;
         }
     }
 
-    log::info!("Initiating node {} lookup by {}", second.0, first.0);
+    log::info!("Initiating node lookup {} by {}", to_find.0, searcher.0);
 
-    first
+    searcher
         .1
         .send(KadEvtFindNode {
-            key: second.0.key.clone(),
+            key: to_find.0.key.clone(),
             timeout: 0f64,
         })
         .await?

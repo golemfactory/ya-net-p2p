@@ -1,63 +1,60 @@
-use crate::key::RangeOps;
 use crate::{Key, KeyLen, Node};
 use chrono::{DateTime, Duration, Utc};
 use itertools::Itertools;
-use num_bigint::{BigUint, ToBigUint};
 use serde::{Deserialize, Serialize};
-use std::ops::Range;
 
-const BUCKET_REFRESH_INTERVAL: i64 = 3600;
 pub const K: usize = 20;
+const BUCKET_REFRESH_INTERVAL: i64 = 3600;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Table<N: KeyLen> {
     pub key: Key<N>,
     buckets: Vec<Bucket<N>>,
-    pub k: usize,
+    pub bucket_size: usize,
 }
 
 impl<N: KeyLen> Table<N> {
-    pub fn new(key: Key<N>, k: usize) -> Self {
+    pub fn new(key: Key<N>, bucket_size: usize) -> Self {
+        let buckets = vec![Bucket::new(bucket_size)];
         Table {
             key,
-            buckets: vec![Bucket::new(Key::<N>::range(), k)],
-            k,
+            buckets,
+            bucket_size,
         }
     }
 
-    #[inline]
-    pub fn get(&self, key: &Key<N>) -> Option<&Node<N>> {
-        let idx = self.bucket_index(&key);
-        self.buckets[idx].get(key)
+    pub fn node_count(&self) -> usize {
+        self.buckets.iter().map(|b| b.nodes.len()).sum()
     }
 
     pub fn add(&mut self, node: &Node<N>) -> bool {
-        self.dedup(&node);
-
         let idx = self.bucket_index(&node.key);
         let bucket = &mut self.buckets[idx];
 
         if bucket.add(node.clone()) {
             true
-        // Per section 4.2 of paper, split if the bucket has the node in its range
-        // or if the depth is not congruent to 0 mod 5
-        } else if bucket.in_range(&self.key) || bucket.depth() % 5 != 0 {
+        } else if idx != self.buckets.len() - 1 || self.buckets.len() == N::to_usize() * 8 {
+            false
+        } else {
             self.split(idx);
             self.add(node)
-        } else {
-            false
         }
     }
 
     #[inline]
-    pub fn remove(&mut self, node: &Node<N>) -> Option<Node<N>> {
-        let idx = self.bucket_index(&node.key);
-        self.buckets[idx].remove(node)
+    pub fn remove(&mut self, key: &Key<N>) {
+        let idx = self.bucket_index(&key);
+        self.buckets[idx].remove(key)
     }
 
     #[inline]
     pub fn contains(&self, node: &Node<N>) -> bool {
         self.buckets[self.bucket_index(&node.key)].contains(node)
+    }
+
+    #[inline]
+    pub fn get(&self, key: &Key<N>) -> Option<&Node<N>> {
+        self.buckets[self.bucket_index(&key)].get(key)
     }
 
     #[inline]
@@ -71,39 +68,34 @@ impl<N: KeyLen> Table<N> {
         excluded: Option<&Key<N>>,
         max: Option<usize>,
     ) -> Vec<Node<N>> {
-        let max = max.unwrap_or(self.k);
         TableIter::new(&self.buckets, self.bucket_index(key))
             .filter(|n| excluded.map(|e| &n.key != e).unwrap_or(true))
             .cloned()
-            .take(max)
-            .sorted_by_key(|e| self.key.distance(&e.key))
+            .take(max.unwrap_or(self.bucket_size))
+            .sorted_by_key(|e| key.distance(&e.key))
             .collect()
     }
 
-    fn bucket_index(&self, key: &Key<N>) -> usize {
-        let key = key.to_biguint().unwrap();
-
-        self.buckets
-            .iter()
-            .enumerate()
-            .find(|(_, b)| key < b.range.end)
-            .map(|(i, _)| i)
-            .expect("bucket_index must yield a value")
+    #[inline]
+    pub fn bucket_oldest(&self, key: &Key<N>) -> Option<Node<N>> {
+        let idx = self.bucket_index(key);
+        self.buckets[idx].oldest().cloned()
     }
 
-    fn dedup(&mut self, node: &Node<N>) {
-        let key = &node.key;
-        let address = node.address;
-
-        self.buckets
-            .iter_mut()
-            .for_each(|b| b.inner.retain(|e| e.address != address || &e.key == key));
+    #[inline]
+    fn bucket_index(&self, key: &Key<N>) -> usize {
+        let distance = self.key.distance(&key).leading_zeros();
+        std::cmp::min(distance, self.buckets.len() - 1)
     }
 
     fn split(&mut self, idx: usize) {
-        let (first, second) = self.buckets[idx].split();
-        self.buckets[idx] = first;
-        self.buckets.insert(idx + 1, second);
+        let queue = std::mem::replace(&mut self.buckets[idx].queue, Vec::new());
+        let bucket = self.buckets[idx].split(&self.key, idx);
+
+        self.buckets.insert(idx + 1, bucket);
+        queue.iter().for_each(|node| {
+            self.add(node);
+        });
     }
 }
 
@@ -119,7 +111,7 @@ impl<'b, N: KeyLen> TableIter<'b, N> {
         TableIter {
             buckets_l: &buckets[..idx],
             buckets_r: &buckets[idx + 1..],
-            bucket: &buckets[idx].inner,
+            bucket: &buckets[idx].nodes,
             left: true,
         }
     }
@@ -134,14 +126,14 @@ impl<'b, N: KeyLen> Iterator for TableIter<'b, N> {
             if self.left {
                 let len = self.buckets_l.len();
                 if len > 0 {
-                    self.bucket = &self.buckets_l[len - 1].inner;
+                    self.bucket = &self.buckets_l[len - 1].nodes;
                     self.buckets_l = &self.buckets_l[..len - 1];
                     return self.next();
                 }
             } else {
                 let len = self.buckets_r.len();
                 if len > 0 {
-                    self.bucket = &self.buckets_r[len - 1].inner;
+                    self.bucket = &self.buckets_r[len - 1].nodes;
                     self.buckets_r = &self.buckets_r[..len - 1];
                     return self.next();
                 }
@@ -158,31 +150,44 @@ impl<'b, N: KeyLen> Iterator for TableIter<'b, N> {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Bucket<N: KeyLen> {
-    inner: Vec<Node<N>>,
-    queue: Vec<Node<N>>,
     updated: DateTime<Utc>,
-    pub range: Range<BigUint>,
-    pub k: usize,
+    nodes: Vec<Node<N>>,
+    queue: Vec<Node<N>>,
+    size: usize,
 }
 
 impl<N: KeyLen> Bucket<N> {
-    fn new(range: Range<BigUint>, k: usize) -> Self {
-        Self::with_inner(Vec::with_capacity(k), range, k)
+    fn new(size: usize) -> Self {
+        Self::with_nodes(Vec::with_capacity(size), size)
     }
 
-    fn with_inner(inner: Vec<Node<N>>, range: Range<BigUint>, k: usize) -> Self {
+    fn with_nodes(nodes: Vec<Node<N>>, size: usize) -> Self {
         Bucket {
-            inner,
-            queue: Vec::new(),
             updated: Utc::now(),
-            range,
-            k,
+            nodes,
+            queue: Vec::new(),
+            size,
         }
     }
 
+    #[inline(always)]
+    pub fn oldest(&self) -> Option<&Node<N>> {
+        self.nodes.get(0)
+    }
+
+    #[inline(always)]
+    pub fn stale(&self) -> bool {
+        Utc::now() - self.updated > Duration::seconds(BUCKET_REFRESH_INTERVAL)
+    }
+
+    #[inline(always)]
+    fn contains(&self, node: &Node<N>) -> bool {
+        self.nodes.contains(node)
+    }
+
     fn get(&self, key: &Key<N>) -> Option<&Node<N>> {
-        match self.inner.iter().position(|x| &x.key == key) {
-            Some(i) => Some(&self.inner[i]),
+        match self.nodes.iter().position(|node| &node.key == key) {
+            Some(idx) => Some(&self.nodes[idx]),
             None => None,
         }
     }
@@ -190,13 +195,10 @@ impl<N: KeyLen> Bucket<N> {
     fn add(&mut self, node: Node<N>) -> bool {
         self.updated = Utc::now();
 
-        if self.contains(&node) {
-            self.remove(&node);
-        }
-
-        let push = self.inner.len() < self.k;
+        self.remove(&node.key);
+        let push = self.nodes.len() < self.size;
         if push {
-            self.inner.push(node);
+            self.nodes.push(node);
         // If the bucket is full, keep track of node in a replacement list,
         // per section 4.1 of the paper.
         } else {
@@ -205,63 +207,21 @@ impl<N: KeyLen> Bucket<N> {
         push
     }
 
-    fn remove(&mut self, node: &Node<N>) -> Option<Node<N>> {
-        match self.inner.iter().position(|x| x == node) {
-            // Set a replacement for the deleted node
-            Some(i) => {
-                let result = Some(self.inner.remove(i));
-                if let Some(queued) = self.queue.pop() {
-                    self.add(queued);
-                }
-                result
+    fn remove(&mut self, key: &Key<N>) {
+        if let Some(idx) = self.nodes.iter().position(|node| &node.key == key) {
+            self.nodes.remove(idx);
+            if let Some(queued) = self.queue.pop() {
+                self.add(queued);
             }
-            None => None,
         }
     }
 
-    fn split(&self) -> (Bucket<N>, Bucket<N>) {
-        let (rf, rs) = self.range.split();
-        let start_bytes = rs.start.to_bytes_be();
-        let (f, s) = self
-            .inner
-            .clone()
+    fn split(&mut self, key: &Key<N>, idx: usize) -> Bucket<N> {
+        let nodes = std::mem::replace(&mut self.nodes, Vec::new());
+        let (retain, split) = nodes
             .into_iter()
-            .partition(|n| n.key.as_ref() < start_bytes.as_slice());
-
-        (
-            Bucket::with_inner(f, rf, self.k),
-            Bucket::with_inner(s, rs, self.k),
-        )
-    }
-
-    #[inline(always)]
-    fn in_range(&self, key: &Key<N>) -> bool {
-        let big_uint = key.to_biguint().unwrap();
-        self.range.contains(&big_uint)
-    }
-
-    #[inline(always)]
-    fn contains(&self, node: &Node<N>) -> bool {
-        self.inner.contains(node)
-    }
-
-    fn depth(&self) -> usize {
-        let first = match self.inner.get(0) {
-            Some(e) => e.key.as_ref(),
-            None => return 0,
-        };
-
-        self.inner[1..].iter().fold(first.len(), move |len, n| {
-            let key = n.key.as_ref();
-            std::cmp::min(
-                len,
-                key.iter().zip(first).take_while(|(e, o)| e.eq(o)).count(),
-            )
-        })
-    }
-
-    #[inline(always)]
-    fn stale(&self) -> bool {
-        Utc::now() - self.updated > Duration::seconds(BUCKET_REFRESH_INTERVAL)
+            .partition(|node| node.key.distance(key).leading_zeros() == idx);
+        std::mem::replace(&mut self.nodes, retain);
+        Bucket::with_nodes(split, self.size)
     }
 }
