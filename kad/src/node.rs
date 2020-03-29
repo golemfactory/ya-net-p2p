@@ -11,17 +11,15 @@ pub struct Node<N: KeyLen> {
 
 impl<N: KeyLen> Node<N> {
     #[inline(always)]
-    pub fn distance(&self, other: &Self) -> Key<N> {
-        self.key.distance(&other.key)
+    pub fn distance<O: AsRef<[u8]>>(&self, other: &O) -> Key<N> {
+        self.key.distance(other)
     }
-}
 
-impl<N: KeyLen> std::fmt::Display for Node<N> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!(
-            "Node {{ key: {}, address: {:?} }}",
-            self.key, self.address
-        ))
+    pub fn from_vec(vec: Vec<message::Node>) -> Vec<Self> {
+        vec.into_iter()
+            .map(Node::<N>::try_from)
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>()
     }
 }
 
@@ -46,7 +44,7 @@ impl<N: KeyLen> TryFrom<message::Node> for Node<N> {
                         SocketAddr::from((Ipv6Addr::from(ip), node.port as u16))
                     }
                 },
-                None => return Err(Error::property("Node", "ip == None")),
+                None => return Err(Error::property("Node", "Missing ip")),
             },
         })
     }
@@ -68,7 +66,23 @@ impl<N: KeyLen> From<Node<N>> for message::Node {
                 }
             },
             port: node.address.port() as u32,
-            key: node.key.as_ref().to_vec(),
+            key: node.key.to_vec(),
         }
+    }
+}
+
+impl<N: KeyLen> AsRef<[u8]> for Node<N> {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.key.as_ref()
+    }
+}
+
+impl<N: KeyLen> std::fmt::Display for Node<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!(
+            "Node {{ key: {}, address: {:?} }}",
+            self.key, self.address
+        ))
     }
 }

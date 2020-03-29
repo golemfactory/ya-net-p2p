@@ -8,10 +8,10 @@ use std::convert::TryFrom;
 use std::hash::Hash;
 use std::iter::FromIterator;
 
-pub trait KeyLen: ArrayLength<u8> + Unpin + Clone + Ord + Hash {}
-impl<L> KeyLen for L where L: ArrayLength<u8> + Unpin + Clone + Ord + Hash {}
+pub trait KeyLen: ArrayLength<u8> + std::fmt::Debug + Unpin + Clone + Ord + Hash {}
+impl<L> KeyLen for L where L: ArrayLength<u8> + std::fmt::Debug + Unpin + Clone + Ord + Hash {}
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Deserialize, Serialize)]
 pub struct Key<N: KeyLen> {
     inner: GenericArray<u8, N>,
 }
@@ -39,33 +39,23 @@ impl<N: KeyLen> Key<N> {
         Self { inner }
     }
 
-    #[inline]
-    pub fn generate<F: FnMut(usize) -> u8>(f: F) -> Self {
-        Self {
-            inner: GenericArray::<u8, N>::generate(f),
-        }
-    }
-
     pub fn distance<O: AsRef<[u8]>>(&self, other: &O) -> Self {
         let other = other.as_ref();
         let l = other.len();
         let n = N::to_usize();
-        let d = if l > n {
-            return Self {
-                inner: GenericArray::<u8, N>::generate(|_| 0xff),
-            };
-        } else {
-            n - l
-        };
 
-        Self {
-            inner: GenericArray::<u8, N>::from_iter(
+        let inner = if l > n {
+            GenericArray::<u8, N>::generate(|_| 0xff)
+        } else {
+            GenericArray::<u8, N>::from_iter(
                 self.inner
                     .iter()
-                    .zip(std::iter::repeat(&0u8).take(d).chain(other.iter()))
+                    .zip(std::iter::repeat(&0u8).take(n - l).chain(other.iter()))
                     .map(|(f, s)| f ^ s),
-            ),
-        }
+            )
+        };
+
+        Self { inner }
     }
 
     pub fn leading_zeros(&self) -> usize {
@@ -78,13 +68,15 @@ impl<N: KeyLen> Key<N> {
         });
 
         match result {
-            Ok(v) => v,
-            Err(v) => v,
+            Ok(v) | Err(v) => v,
         }
     }
-}
 
-impl<N: KeyLen> Key<N> {
+    #[inline]
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.as_ref().to_vec()
+    }
+
     #[inline]
     pub fn fmt_key<K: AsRef<[u8]>>(key: K) -> String {
         let r = key.as_ref();
@@ -97,6 +89,25 @@ impl<N: KeyLen> Key<N> {
     }
 }
 
+impl<N: KeyLen> TryFrom<Vec<u8>> for Key<N> {
+    type Error = Error;
+
+    fn try_from(other: Vec<u8>) -> Result<Self, Self::Error> {
+        let l = other.len();
+        let n = N::to_usize();
+
+        if l > n {
+            Err(Error::InvalidKeyLength(l))
+        } else {
+            Ok(Key {
+                inner: GenericArray::<u8, N>::from_iter(
+                    std::iter::repeat(0u8).take(n - l).chain(other.into_iter()),
+                ),
+            })
+        }
+    }
+}
+
 impl<N: KeyLen> AsRef<[u8]> for Key<N> {
     #[inline]
     fn as_ref(&self) -> &[u8] {
@@ -104,28 +115,31 @@ impl<N: KeyLen> AsRef<[u8]> for Key<N> {
     }
 }
 
+impl<N: KeyLen> std::hash::Hash for Key<N> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write(self.inner.as_slice())
+    }
+}
+
 impl<N: KeyLen> std::fmt::Display for Key<N> {
+    #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&Self::fmt_key(self))
     }
 }
 
-impl<N: KeyLen> TryFrom<Vec<u8>> for Key<N> {
-    type Error = Error;
+#[cfg(test)]
+mod test {
+    use super::*;
+    use generic_array::typenum::{Unsigned, U128};
+    use generic_array::ArrayLength;
 
-    fn try_from(other: Vec<u8>) -> Result<Self, Self::Error> {
-        let l = other.len();
-        let n = N::to_usize();
-        let d = if l > n {
-            return Err(Error::InvalidKeyLength(l));
-        } else {
-            n - l
-        };
+    type Size = U128;
 
-        Ok(Key {
-            inner: GenericArray::<u8, N>::from_iter(
-                std::iter::repeat(0u8).take(d).chain(other.into_iter()),
-            ),
-        })
+    fn leading_zeros() {
+        for i in 0..(Size::to_usize() * 8) {
+            let key = Key::<Size>::random(i);
+            assert_eq!(key.leading_zeros(), i);
+        }
     }
 }

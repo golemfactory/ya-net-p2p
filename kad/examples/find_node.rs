@@ -7,10 +7,8 @@ use rand::Rng;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::SocketAddr;
-use std::time::Duration;
 use structopt::StructOpt;
-use tokio::time::delay_for;
-use ya_net_kad::{Error, KadEvtBootstrap, KadEvtFindNode, KadEvtReceive, KadEvtSend};
+use ya_net_kad::{event::*, Error};
 
 type Size = U64;
 
@@ -19,11 +17,6 @@ type Node = ya_net_kad::Node<Size>;
 type Kad = ya_net_kad::Kad<Size>;
 
 const MULTIPLIER: usize = 16;
-
-fn gen_key() -> Key {
-    let mut rng = rand::thread_rng();
-    Key::generate(|_| rng.gen_range(0, 256) as u8)
-}
 
 fn gen_address() -> SocketAddr {
     let mut rng = rand::thread_rng();
@@ -42,7 +35,7 @@ fn gen_address() -> SocketAddr {
 fn gen_keys(count: usize) -> HashSet<Key> {
     let mut set = HashSet::with_capacity(count);
     while set.len() < count {
-        set.insert(gen_key());
+        set.insert(Key::random(0));
     }
     set
 }
@@ -73,7 +66,7 @@ fn spawn_nodes(
     mpsc::Receiver<KadEvtSend<Size>>,
 ) {
     let (tx, rx) = mpsc::channel(size * MULTIPLIER);
-    let mut nodes = gen_nodes(size + (size + 99) / 100)
+    let mut nodes = gen_nodes(size + (size + 99) / 100 + 1)
         .into_iter()
         .collect::<Vec<_>>();
 
@@ -119,22 +112,37 @@ async fn bootstrap(
     boot: &HashMap<Node, Addr<Kad>>,
     nodes: &HashMap<Node, Addr<Kad>>,
 ) -> Result<(), Error> {
-    let delay = Duration::from_millis(25);
+    use std::time::Duration;
+    use tokio::time::delay_for;
+
     let init_vec = boot.iter().map(|(n, _)| n).cloned().collect::<Vec<_>>();
 
-    for _ in 0..2 {
-        for (node, addr) in nodes.iter() {
-            log::info!("Bootstrapping {}", node);
+    for (node, addr) in boot.iter() {
+        log::info!("Bootstrapping {}", node);
 
-            addr.send(KadEvtBootstrap {
-                nodes: init_vec.clone(),
-            })
-            .await??;
-
-            delay_for(delay).await;
-        }
+        addr.send(KadEvtBootstrap {
+            nodes: init_vec.clone(),
+            dormant: true,
+        })
+        .await??;
     }
 
+    let mut futs = Vec::new();
+
+    // FIXME: better initialization
+    for _ in 0..3 {
+        for (_, addr) in nodes.iter() {
+            futs.push(addr.send(KadEvtBootstrap {
+                nodes: init_vec.clone(),
+                dormant: false,
+            }));
+
+            delay_for(Duration::from_millis(2)).await;
+        }
+        delay_for(Duration::from_millis(500)).await;
+    }
+
+    futures::future::join_all(futs).await;
     Ok(())
 }
 
@@ -156,7 +164,7 @@ async fn find_node(nodes: &HashMap<Node, Addr<Kad>>) -> Result<Option<Node>, Err
         }
     }
 
-    log::info!("Initiating node lookup {} by {}", to_find.0, searcher.0);
+    log::info!("Initiating node query {} by {}", to_find.0, searcher.0);
 
     searcher
         .1

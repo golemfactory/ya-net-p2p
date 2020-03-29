@@ -36,6 +36,7 @@ pub struct KadEvtFindValue {
 #[rtype(result = "Result<()>")]
 pub struct KadEvtBootstrap<N: KeyLen> {
     pub nodes: Vec<Node<N>>,
+    pub dormant: bool,
 }
 
 macro_rules! kad_message {
@@ -101,7 +102,7 @@ impl KadMessage {
         }
     }
 
-    pub fn searched_key(&self) -> Option<Vec<u8>> {
+    pub fn queried_key(&self) -> Option<Vec<u8>> {
         match &self {
             KadMessage::FindNode(m) => Some(m.key.clone()),
             KadMessage::FindValue(m) => Some(m.key.clone()),

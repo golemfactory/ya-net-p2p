@@ -1,14 +1,13 @@
-pub use event::*;
 pub use key::{Key, KeyLen};
 pub use node::Node;
 pub use service::Kad;
-pub use table::{Table, K};
+pub use table::Table;
 
-mod event;
+pub mod event;
 mod key;
 mod node;
 mod service;
-mod table;
+pub mod table;
 
 pub mod message {
     include!(concat!(env!("OUT_DIR"), "/kad.rs"));
@@ -26,22 +25,15 @@ pub enum Error {
     InvalidKeyLength(usize),
     #[error("Invalid lookup value: {0}")]
     InvalidLookupValue(String),
-    #[error("Invalid message: {0}")]
-    InvalidMessage(String),
     #[error("Invalid property {1} in message {0}")]
     InvalidProperty(String, String),
     #[error("Missing request: {0}")]
     MissingRequest(String),
-    #[error("Invalid lookup: {0}")]
-    InvalidLookup(String),
+    #[error("Invalid query: {0}")]
+    InvalidQuery(String),
 }
 
 impl Error {
-    #[inline]
-    pub fn message(m: impl ToString) -> Self {
-        Error::InvalidMessage(m.to_string())
-    }
-
     #[inline]
     pub fn property(m: impl ToString, p: impl ToString) -> Self {
         Error::InvalidProperty(m.to_string(), p.to_string())
@@ -53,8 +45,8 @@ impl Error {
     }
 
     #[inline]
-    pub fn lookup(key: &Vec<u8>) -> Self {
-        Error::InvalidLookup(format!("Lookup for {} not found", hex::encode(key)))
+    pub fn query(key: &Vec<u8>) -> Self {
+        Error::InvalidQuery(format!("Query for {} not found", hex::encode(key)))
     }
 
     #[inline]

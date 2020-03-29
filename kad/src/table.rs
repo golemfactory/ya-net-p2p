@@ -1,6 +1,5 @@
 use crate::{Key, KeyLen, Node};
 use chrono::{DateTime, Duration, Utc};
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 pub const K: usize = 20;
@@ -23,18 +22,30 @@ impl<N: KeyLen> Table<N> {
         }
     }
 
-    pub fn node_count(&self) -> usize {
-        self.buckets.iter().map(|b| b.nodes.len()).sum()
-    }
-
     pub fn add(&mut self, node: &Node<N>) -> bool {
         let idx = self.bucket_index(&node.key);
+        let len = self.buckets.len();
         let bucket = &mut self.buckets[idx];
 
-        if bucket.add(node.clone()) {
+        if node.key == self.key || bucket.add(node) {
             true
-        } else if idx != self.buckets.len() - 1 || self.buckets.len() == N::to_usize() * 8 {
+        // middle bucket
+        } else if idx != len - 1 {
+            let furthest_key = match bucket.furthest(&self.key) {
+                Some(node) => node.key.clone(),
+                None => return false,
+            };
+            if furthest_key.distance(&self.key) >= node.distance(&self.key) {
+                bucket.remove(&furthest_key);
+                return bucket.add(node);
+            }
+
+            bucket.queue.push(node.clone());
             false
+        // table full
+        } else if len == N::to_usize() * 8 {
+            false
+        // split the last bucket
         } else {
             self.split(idx);
             self.add(node)
@@ -57,23 +68,54 @@ impl<N: KeyLen> Table<N> {
         self.buckets[self.bucket_index(&key)].get(key)
     }
 
-    #[inline]
-    pub fn stale_buckets(&self) -> Vec<&Bucket<N>> {
-        self.buckets.iter().filter(|b| b.stale()).collect()
-    }
-
     pub fn neighbors(
         &self,
         key: &Key<N>,
         excluded: Option<&Key<N>>,
         max: Option<usize>,
     ) -> Vec<Node<N>> {
-        TableIter::new(&self.buckets, self.bucket_index(key))
-            .filter(|n| excluded.map(|e| &n.key != e).unwrap_or(true))
-            .cloned()
-            .take(max.unwrap_or(self.bucket_size))
-            .sorted_by_key(|e| key.distance(&e.key))
-            .collect()
+        let max = max.unwrap_or(self.bucket_size);
+        let mut result = Vec::new();
+
+        let _ = AlternatingIter::new(self.bucket_index(key), self.buckets.len()).try_fold(
+            0 as usize,
+            |acc, i| {
+                result.extend(
+                    self.buckets[i]
+                        .as_ref()
+                        .iter()
+                        .filter(|n| Some(&n.key) != excluded)
+                        .take(2 * max - acc)
+                        .cloned(),
+                );
+                if result.len() == max * 2 {
+                    return Err(());
+                }
+                Ok(result.len())
+            },
+        );
+
+        result.sort_by_key(|n| key.distance(n));
+        result.truncate(max);
+        result
+    }
+
+    #[inline]
+    pub fn stale_buckets(&self) -> Vec<&Bucket<N>> {
+        self.buckets.iter().filter(|b| b.stale()).collect()
+    }
+
+    #[inline]
+    pub fn distant_nodes(&self, key: &Key<N>) -> Vec<Node<N>> {
+        let idx = self.bucket_index(key);
+        if idx == self.buckets.len() - 1 {
+            Vec::new()
+        } else {
+            self.buckets[idx + 1..]
+                .iter()
+                .filter_map(|b| b.oldest().cloned())
+                .collect()
+        }
     }
 
     #[inline]
@@ -88,6 +130,7 @@ impl<N: KeyLen> Table<N> {
         std::cmp::min(distance, self.buckets.len() - 1)
     }
 
+    #[inline]
     fn split(&mut self, idx: usize) {
         let queue = std::mem::replace(&mut self.buckets[idx].queue, Vec::new());
         let bucket = self.buckets[idx].split(&self.key, idx);
@@ -99,52 +142,54 @@ impl<N: KeyLen> Table<N> {
     }
 }
 
-struct TableIter<'b, N: KeyLen> {
-    buckets_l: &'b [Bucket<N>],
-    buckets_r: &'b [Bucket<N>],
-    bucket: &'b [Node<N>],
-    left: bool,
+struct AlternatingIter {
+    start: usize,
+    len: usize,
+    idx: Option<usize>,
 }
 
-impl<'b, N: KeyLen> TableIter<'b, N> {
-    fn new(buckets: &'b [Bucket<N>], idx: usize) -> Self {
-        TableIter {
-            buckets_l: &buckets[..idx],
-            buckets_r: &buckets[idx + 1..],
-            bucket: &buckets[idx].nodes,
-            left: true,
+impl AlternatingIter {
+    pub fn new(start: usize, len: usize) -> Self {
+        AlternatingIter {
+            start,
+            len,
+            idx: None,
         }
     }
 }
 
-impl<'b, N: KeyLen> Iterator for TableIter<'b, N> {
-    type Item = &'b Node<N>;
+impl Iterator for AlternatingIter {
+    type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let cur_len = self.bucket.len();
-        if cur_len == 0 {
-            if self.left {
-                let len = self.buckets_l.len();
-                if len > 0 {
-                    self.bucket = &self.buckets_l[len - 1].nodes;
-                    self.buckets_l = &self.buckets_l[..len - 1];
-                    return self.next();
-                }
-            } else {
-                let len = self.buckets_r.len();
-                if len > 0 {
-                    self.bucket = &self.buckets_r[len - 1].nodes;
-                    self.buckets_r = &self.buckets_r[..len - 1];
-                    return self.next();
+        match self.idx {
+            None => {
+                self.idx.replace(self.start);
+            }
+            Some(idx) => {
+                if idx > self.start {
+                    let di = idx - self.start;
+                    if di <= self.start {
+                        self.idx.replace(self.start - di);
+                    } else if idx < self.len - 1 {
+                        self.idx.replace(idx + 1);
+                    } else {
+                        return None;
+                    }
+                } else {
+                    let di = self.start - idx;
+                    if self.start + di + 1 < self.len {
+                        self.idx.replace(self.start + di + 1);
+                    } else if idx > 0 {
+                        self.idx.replace(idx - 1);
+                    } else {
+                        return None;
+                    }
                 }
             }
-        } else {
-            let elem = &self.bucket[cur_len - 1];
-            self.bucket = &self.bucket[..cur_len - 1];
-            return Some(elem);
         }
 
-        None
+        self.idx.clone()
     }
 }
 
@@ -176,6 +221,11 @@ impl<N: KeyLen> Bucket<N> {
     }
 
     #[inline(always)]
+    pub fn furthest(&self, key: &Key<N>) -> Option<&Node<N>> {
+        self.nodes.iter().max_by_key(|n| n.distance(key))
+    }
+
+    #[inline(always)]
     pub fn stale(&self) -> bool {
         Utc::now() - self.updated > Duration::seconds(BUCKET_REFRESH_INTERVAL)
     }
@@ -192,26 +242,23 @@ impl<N: KeyLen> Bucket<N> {
         }
     }
 
-    fn add(&mut self, node: Node<N>) -> bool {
+    fn add(&mut self, node: &Node<N>) -> bool {
         self.updated = Utc::now();
 
         self.remove(&node.key);
-        let push = self.nodes.len() < self.size;
-        if push {
-            self.nodes.push(node);
-        // If the bucket is full, keep track of node in a replacement list,
-        // per section 4.1 of the paper.
-        } else {
-            self.queue.push(node);
+        if self.nodes.len() < self.size {
+            self.nodes.push(node.clone());
+            return true;
         }
-        push
+
+        false
     }
 
     fn remove(&mut self, key: &Key<N>) {
         if let Some(idx) = self.nodes.iter().position(|node| &node.key == key) {
             self.nodes.remove(idx);
             if let Some(queued) = self.queue.pop() {
-                self.add(queued);
+                self.add(&queued);
             }
         }
     }
@@ -220,8 +267,14 @@ impl<N: KeyLen> Bucket<N> {
         let nodes = std::mem::replace(&mut self.nodes, Vec::new());
         let (retain, split) = nodes
             .into_iter()
-            .partition(|node| node.key.distance(key).leading_zeros() == idx);
+            .partition(|node| node.distance(key).leading_zeros() == idx);
         std::mem::replace(&mut self.nodes, retain);
         Bucket::with_nodes(split, self.size)
+    }
+}
+
+impl<N: KeyLen> AsRef<[Node<N>]> for Bucket<N> {
+    fn as_ref(&self) -> &[Node<N>] {
+        &self.nodes
     }
 }
