@@ -101,8 +101,13 @@ impl<N: KeyLen> Table<N> {
     }
 
     #[inline]
-    pub fn stale_buckets(&self) -> Vec<&Bucket<N>> {
-        self.buckets.iter().filter(|b| b.stale()).collect()
+    pub fn stale_buckets(&self) -> Vec<usize> {
+        self.buckets
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.stale())
+            .map(|(i, _)| i)
+            .collect()
     }
 
     #[inline]

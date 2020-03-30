@@ -21,14 +21,14 @@ const ALPHA: usize = 8;
 const MAX_KEY_SZ: usize = 33;
 const MAX_VAL_SZ: usize = 65535;
 const MAX_VAL_TTL: u32 = 604800;
-const MAX_REQ_TTL: i64 = 3;
+const MAX_REQ_TTL: i64 = 5;
 const MAX_QRY_TTL: i64 = 30;
 
 lazy_static::lazy_static! {
     static ref REQUEST_UPKEEP_INTERVAL: Duration = Duration::from_secs(2);
     static ref STORAGE_UPKEEP_INTERVAL: Duration = Duration::from_secs(60);
-    static ref QUERY_UPKEEP_INTERVAL: Duration = Duration::from_secs(1);
-    static ref REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+    static ref QUERY_UPKEEP_INTERVAL: Duration = Duration::from_secs(3);
+    static ref TABLE_UPKEEP_INTERVAL: Duration = Duration::from_secs(60);
 }
 
 pub struct Kad<N>
@@ -67,14 +67,6 @@ where
         }
     }
 
-    fn keys_to_refresh(&self) -> Vec<Key<N>> {
-        self.table
-            .stale_buckets()
-            .into_iter()
-            .filter_map(|b| b.oldest().map(|n| n.key.clone()))
-            .collect()
-    }
-
     #[inline]
     fn storage_upkeep(&mut self, _: &mut Context<Self>) {
         let now = Utc::now().timestamp();
@@ -109,6 +101,23 @@ where
                 query.iterate();
             }
             query.in_progress()
+        });
+    }
+
+    #[inline]
+    fn table_upkeep(&mut self, ctx: &mut Context<Self>) {
+        let address = ctx.address();
+        self.table.stale_buckets().into_iter().for_each(|i| {
+            let key = Key::<N>::random(i);
+            let neighbors = self.table.neighbors(&key, Some(&key), Some(ALPHA));
+
+            log::debug!(
+                "{} table refresh: querying {} ({} nodes)",
+                self.name,
+                key,
+                neighbors.len()
+            );
+            self.initiate_query(QueryKey::Node(key.to_vec()), neighbors, address.clone());
         });
     }
 }
@@ -202,6 +211,9 @@ where
         IntervalFunc::new(*REQUEST_UPKEEP_INTERVAL, Self::request_upkeep)
             .finish()
             .spawn(ctx);
+        IntervalFunc::new(*TABLE_UPKEEP_INTERVAL, Self::table_upkeep)
+            .finish()
+            .spawn(ctx);
 
         log::info!("{} ({}) service started", self.name, self.me.key);
     }
@@ -236,7 +248,6 @@ where
 
             async move {
                 query.await;
-
                 Ok(())
             }
             .right_future()
