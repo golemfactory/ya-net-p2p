@@ -54,9 +54,7 @@ fn gen_nodes(count: usize) -> HashSet<Node> {
 
 fn find_neighbors(key: &Key, nodes: &HashSet<Node>, rn: &Node) -> Vec<Node> {
     let mut table = Table::new(key.clone(), K);
-    nodes.iter().for_each(|node| {
-        table.add(node);
-    });
+    table.extend(nodes.iter());
     table.neighbors(&rn.key, None, Some(K))
 }
 
@@ -104,12 +102,7 @@ fn main() {
 
     println!("Searched key: {}", rand_node.key);
 
-    let start = 1;
-    let mut iter = sorted.iter().skip(start);
-
-    for i in start..K {
-        let next = iter.next().unwrap();
-
+    for (i, next) in sorted.iter().skip(1).enumerate() {
         println!();
         println!("{}. neighbor: {}", i, next.key);
         println!();

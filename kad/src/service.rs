@@ -59,7 +59,7 @@ where
         Self {
             name: name.to_string(),
             me,
-            table: Table::new(key, std::cmp::max(crate::table::K, N::to_usize() / 2)),
+            table: Table::new(key, N::to_usize()),
             storage: HashMap::new(),
             queries: HashMap::new(),
             requests: HashMap::new(),
@@ -229,9 +229,7 @@ where
     fn handle(&mut self, msg: KadEvtBootstrap<N>, ctx: &mut Context<Self>) -> Self::Result {
         log::debug!("{} bootstrapping", self.name);
 
-        msg.nodes.iter().for_each(|node| {
-            self.table.add(node);
-        });
+        self.table.extend(msg.nodes.iter());
 
         let fut = if msg.dormant {
             async move {
@@ -362,8 +360,8 @@ where
             Err(error) => return error.fut().left_future(),
         };
         let now = Utc::now().timestamp();
-
         self.storage.insert(msg.key, (value, now));
+
         async move { Ok(None) }.right_future()
     }
 
@@ -411,10 +409,9 @@ where
                     Key::<N>::fmt_key(&query.key),
                 );
 
+                self.table.extend(nodes.iter());
+
                 if query.key.as_ref() == self.me.key.as_ref() {
-                    nodes.iter().for_each(|n| {
-                        self.table.add(n);
-                    });
                     query.feed(self.table.distant_nodes(&self.me.key), Some(from));
                 } else {
                     let node_idx = nodes
@@ -431,10 +428,7 @@ where
             Err(error) => match error {
                 Error::InvalidQuery(_) => {
                     log::debug!("{} rx nodes ({})", self.name, nodes.len());
-
-                    nodes.iter().for_each(|node| {
-                        self.table.add(node);
-                    });
+                    self.table.extend(nodes.iter());
                 }
                 _ => {
                     log::error!("{}", error);
@@ -501,8 +495,10 @@ where
         match result {
             message::find_value_result::Result::Nodes(res) => {
                 log::debug!("{} rx nodes for value query: {:?}", self.name, query.key);
+                let nodes = Node::from_vec(res.nodes);
+                self.table.extend(nodes.iter());
 
-                query.feed(Node::from_vec(res.nodes), Some(from));
+                query.feed(nodes, Some(from));
             }
             message::find_value_result::Result::Value(res) => {
                 log::debug!("{} rx value for value query: {:?}", self.name, query.key);
@@ -754,18 +750,13 @@ where
             nodes.len(),
             Key::<N>::fmt_key(&key)
         );
-        for node in nodes.iter() {
-            log::trace!(
-                "Send out to: {} (distance: {})",
-                node.key,
-                node.distance(&self.key)
-            );
-        }
 
         actix_rt::spawn(async move {
             let mut rand = rand::thread_rng();
 
             for to in nodes.into_iter() {
+                log::trace!("Send out to: {} (distance: {})", to.key, to.distance(&key));
+
                 let message = match &key {
                     QueryKey::Node(key) => KadMessage::from(message::FindNode {
                         rand_val: rand.next_u32(),

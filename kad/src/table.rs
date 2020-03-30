@@ -12,7 +12,7 @@ pub struct Table<N: KeyLen> {
     pub bucket_size: usize,
 }
 
-impl<N: KeyLen> Table<N> {
+impl<N: KeyLen + 'static> Table<N> {
     pub fn new(key: Key<N>, bucket_size: usize) -> Self {
         let buckets = vec![Bucket::new(bucket_size)];
         Table {
@@ -50,6 +50,13 @@ impl<N: KeyLen> Table<N> {
             self.split(idx);
             self.add(node)
         }
+    }
+
+    #[inline]
+    pub fn extend<'l, I: Iterator<Item = &'l Node<N>>>(&mut self, iter: I) {
+        iter.for_each(|n| {
+            self.add(&n);
+        });
     }
 
     #[inline]
@@ -141,9 +148,7 @@ impl<N: KeyLen> Table<N> {
         let bucket = self.buckets[idx].split(&self.key, idx);
 
         self.buckets.insert(idx + 1, bucket);
-        queue.iter().for_each(|node| {
-            self.add(node);
-        });
+        self.extend(queue.iter());
     }
 }
 
