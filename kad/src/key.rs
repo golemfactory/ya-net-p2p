@@ -5,11 +5,12 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::cmp::min;
 use std::convert::TryFrom;
+use std::fmt::Debug;
 use std::hash::Hash;
 use std::iter::FromIterator;
 
-pub trait KeyLen: ArrayLength<u8> + std::fmt::Debug + Unpin + Clone + Ord + Hash {}
-impl<L> KeyLen for L where L: ArrayLength<u8> + std::fmt::Debug + Unpin + Clone + Ord + Hash {}
+pub trait KeyLen: ArrayLength<u8> + Debug + Unpin + Clone + Ord + Hash {}
+impl<N> KeyLen for N where N: ArrayLength<u8> + Debug + Unpin + Clone + Ord + Hash {}
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Deserialize, Serialize)]
 pub struct Key<N: KeyLen> {
@@ -23,7 +24,7 @@ impl<N: KeyLen> Key<N> {
         let n = N::to_usize();
         let z = leading_zeros / 8;
         let x = (rng.gen::<u8>() >> (leading_zeros % 8) as u8)
-            | 1u8 << (8 - 1 - (leading_zeros % 8)) as u8;
+            | (1u8 << (8 - 1 - (leading_zeros % 8)) as u8);
 
         let inner = if z >= n {
             GenericArray::<u8, N>::from_iter(std::iter::repeat(0u8).take(n))
@@ -60,10 +61,17 @@ impl<N: KeyLen> Key<N> {
 
     pub fn leading_zeros(&self) -> usize {
         let result = self.inner.iter().try_fold(0 as usize, |acc, b| {
-            if acc % 8 == 0 {
-                Ok(acc + b.leading_zeros() as usize)
-            } else {
-                Err(acc)
+            let zeros = b.leading_zeros() as usize;
+            let next = acc + zeros;
+            match next % 8 {
+                0 => {
+                    if zeros < 8 {
+                        Err(next)
+                    } else {
+                        Ok(next)
+                    }
+                }
+                _ => Err(next),
             }
         });
 
@@ -132,10 +140,10 @@ impl<N: KeyLen> std::fmt::Display for Key<N> {
 mod test {
     use super::*;
     use generic_array::typenum::{Unsigned, U128};
-    use generic_array::ArrayLength;
 
     type Size = U128;
 
+    #[test]
     fn leading_zeros() {
         for i in 0..(Size::to_usize() * 8) {
             let key = Key::<Size>::random(i);
