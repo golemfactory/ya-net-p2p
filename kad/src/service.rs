@@ -1,42 +1,60 @@
 use crate::event::*;
-use crate::{message, Error, Key, KeyLen, Node, Result, Table};
+use crate::query::*;
+use crate::*;
 use actix::prelude::*;
 use chrono::Utc;
 use futures::channel::mpsc;
-use futures::task::{Poll, Waker};
 use futures::{Future, FutureExt, SinkExt};
 use generic_array::ArrayLength;
-use itertools::Itertools;
-use rand::RngCore;
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
-use std::pin::Pin;
-use std::rc::Rc;
 use std::time::Duration;
 
-// Number of parallel queries
-const ALPHA: usize = 8;
+#[derive(Clone, Debug)]
+pub struct KadConfig {
+    pub name: String,
+    pub max_key_sz: usize,
+    pub max_val_sz: usize,
+    pub val_ttl: u32,
+    pub req_ttl: i64,
+    pub qry_ttl: i64,
+    pub req_upkeep_freq: Duration,
+    pub sto_upkeep_freq: Duration,
+    pub qry_upkeep_freq: Duration,
+    pub tab_upkeep_freq: Duration,
+}
 
-const MAX_KEY_SZ: usize = 33;
-const MAX_VAL_SZ: usize = 65535;
-const MAX_VAL_TTL: u32 = 604800;
-const MAX_REQ_TTL: i64 = 5;
-const MAX_QRY_TTL: i64 = 30;
+impl KadConfig {
+    pub fn with_name(name: impl ToString) -> Self {
+        let mut conf = Self::default();
+        conf.name = name.to_string();
+        conf
+    }
+}
 
-lazy_static::lazy_static! {
-    static ref REQUEST_UPKEEP_INTERVAL: Duration = Duration::from_secs(2);
-    static ref STORAGE_UPKEEP_INTERVAL: Duration = Duration::from_secs(60);
-    static ref QUERY_UPKEEP_INTERVAL: Duration = Duration::from_secs(3);
-    static ref TABLE_UPKEEP_INTERVAL: Duration = Duration::from_secs(60);
+impl Default for KadConfig {
+    fn default() -> Self {
+        KadConfig {
+            name: "Kad".to_owned(),
+            max_key_sz: 33,
+            max_val_sz: 65535,
+            val_ttl: 604800,
+            req_ttl: 5,
+            qry_ttl: 30,
+            req_upkeep_freq: Duration::from_secs(2),
+            sto_upkeep_freq: Duration::from_secs(60),
+            qry_upkeep_freq: Duration::from_secs(3),
+            tab_upkeep_freq: Duration::from_secs(60),
+        }
+    }
 }
 
 pub struct Kad<N>
 where
-    N: KeyLen + Unpin + 'static,
+    N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
-    name: String,
+    conf: KadConfig,
     me: Node<N>,
     table: Table<N>,
     storage: HashMap<Vec<u8>, (message::Value, i64)>,
@@ -47,17 +65,17 @@ where
 
 impl<N> Kad<N>
 where
-    N: KeyLen + Unpin + 'static,
+    N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     pub fn new(me: Node<N>, tx: mpsc::Sender<KadEvtSend<N>>) -> Self {
-        Self::with_name("Kad", me, tx)
+        Self::with_conf(KadConfig::default(), me, tx)
     }
 
-    pub fn with_name(name: impl ToString, me: Node<N>, tx: mpsc::Sender<KadEvtSend<N>>) -> Self {
+    pub fn with_conf(conf: KadConfig, me: Node<N>, tx: mpsc::Sender<KadEvtSend<N>>) -> Self {
         let key = me.key.clone();
         Self {
-            name: name.to_string(),
+            conf,
             me,
             table: Table::new(key, N::to_usize()),
             storage: HashMap::new(),
@@ -77,10 +95,11 @@ where
     #[inline]
     fn request_upkeep(&mut self, _: &mut Context<Self>) {
         let mut to_remove = HashSet::new();
+        let ttl = self.conf.req_ttl;
         let now = Utc::now().timestamp();
 
         self.requests.retain(|_, (_, key, created_at)| {
-            if now - *created_at < MAX_REQ_TTL {
+            if now - *created_at < ttl {
                 true
             } else {
                 to_remove.insert(key.clone());
@@ -93,9 +112,11 @@ where
 
     #[inline]
     fn query_upkeep(&mut self, _: &mut Context<Self>) {
+        let ttl = self.conf.qry_ttl;
         let now = Utc::now().timestamp();
+
         self.queries.retain(|_, (query, created_at)| {
-            if now - *created_at >= MAX_QRY_TTL {
+            if now - *created_at >= ttl {
                 query.finish(QueryValue::None);
             } else {
                 query.iterate();
@@ -113,7 +134,7 @@ where
 
             log::debug!(
                 "{} table refresh: querying {} ({} nodes)",
-                self.name,
+                self.conf.name,
                 key,
                 neighbors.len()
             );
@@ -124,7 +145,7 @@ where
 
 impl<N> Kad<N>
 where
-    N: KeyLen + Unpin + 'static,
+    N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     fn find_node(&self, key: &Key<N>, excluded: Option<&Key<N>>) -> Vec<Node<N>> {
@@ -183,7 +204,13 @@ where
             .queries
             .entry(query_key.to_vec())
             .or_insert((
-                Query::new(query_key, &nodes, address, self.table.bucket_size),
+                Query::new(
+                    query_key,
+                    &nodes,
+                    address,
+                    self.table.bucket_size,
+                    self.conf.req_ttl,
+                ),
                 Utc::now().timestamp(),
             ))
             .0
@@ -196,38 +223,38 @@ where
 
 impl<N> Actor for Kad<N>
 where
-    N: KeyLen + Unpin + 'static,
+    N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     type Context = Context<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        IntervalFunc::new(*STORAGE_UPKEEP_INTERVAL, Self::storage_upkeep)
+        IntervalFunc::new(self.conf.sto_upkeep_freq, Self::storage_upkeep)
             .finish()
             .spawn(ctx);
-        IntervalFunc::new(*QUERY_UPKEEP_INTERVAL, Self::query_upkeep)
+        IntervalFunc::new(self.conf.qry_upkeep_freq, Self::query_upkeep)
             .finish()
             .spawn(ctx);
-        IntervalFunc::new(*REQUEST_UPKEEP_INTERVAL, Self::request_upkeep)
+        IntervalFunc::new(self.conf.req_upkeep_freq, Self::request_upkeep)
             .finish()
             .spawn(ctx);
-        IntervalFunc::new(*TABLE_UPKEEP_INTERVAL, Self::table_upkeep)
+        IntervalFunc::new(self.conf.tab_upkeep_freq, Self::table_upkeep)
             .finish()
             .spawn(ctx);
 
-        log::info!("{} ({}) service started", self.name, self.me.key);
+        log::info!("{} ({}) service started", self.conf.name, self.me.key);
     }
 }
 
 impl<N> Handler<KadEvtBootstrap<N>> for Kad<N>
 where
-    N: KeyLen + Unpin + 'static,
+    N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     type Result = ActorResponse<Self, (), Error>;
 
     fn handle(&mut self, msg: KadEvtBootstrap<N>, ctx: &mut Context<Self>) -> Self::Result {
-        log::debug!("{} bootstrapping", self.name);
+        log::debug!("{} bootstrapping", self.conf.name);
 
         self.table.extend(msg.nodes.iter());
 
@@ -257,13 +284,13 @@ where
 
 impl<N> Handler<KadEvtReceive<N>> for Kad<N>
 where
-    N: KeyLen + Unpin + 'static,
+    N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     type Result = ActorResponse<Self, (), Error>;
 
     fn handle(&mut self, evt: KadEvtReceive<N>, ctx: &mut Context<Self>) -> Self::Result {
-        log::trace!("{} rx {} from {}", self.name, evt.message, evt.from);
+        log::trace!("{} rx {} from {}", self.conf.name, evt.message, evt.from);
 
         let address = ctx.address();
         let (from, _new, msg) = (evt.from, evt.new, evt.message);
@@ -318,7 +345,7 @@ type HandleMsgResult = Result<Option<KadMessage>>;
 
 impl<N> Kad<N>
 where
-    N: KeyLen + Unpin + 'static,
+    N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     #[inline]
@@ -338,24 +365,24 @@ where
 
     #[inline]
     fn handle_store(&mut self, msg: message::Store) -> impl Future<Output = HandleMsgResult> {
-        fn validate(msg: &message::Store) -> Result<()> {
+        fn validate(msg: &message::Store, conf: &KadConfig) -> Result<()> {
             let value = match msg.value {
                 Some(ref value) => value,
                 None => return Err(Error::property("Store", "value")),
             };
-            if msg.key.len() > MAX_KEY_SZ {
+            if msg.key.len() > conf.max_key_sz {
                 return Err(Error::property("Store", "key"));
             }
-            if value.value.len() > MAX_VAL_SZ {
+            if value.value.len() > conf.max_val_sz {
                 return Err(Error::property("Store", "value"));
             }
-            if value.ttl > MAX_VAL_TTL {
+            if value.ttl > conf.val_ttl {
                 return Err(Error::property("Store", "ttl"));
             }
             Ok(())
         }
 
-        let value = match validate(&msg) {
+        let value = match validate(&msg, &self.conf) {
             Ok(_) => msg.value.unwrap(),
             Err(error) => return error.fut().left_future(),
         };
@@ -403,7 +430,7 @@ where
 
                 log::debug!(
                     "{} rx nodes ({}) from {} for node query: {}",
-                    self.name,
+                    self.conf.name,
                     nodes.len(),
                     from,
                     Key::<N>::fmt_key(&query.key),
@@ -427,7 +454,7 @@ where
             }
             Err(error) => match error {
                 Error::InvalidQuery(_) => {
-                    log::debug!("{} rx nodes ({})", self.name, nodes.len());
+                    log::debug!("{} rx nodes ({})", self.conf.name, nodes.len());
                     self.table.extend(nodes.iter());
                 }
                 _ => {
@@ -494,14 +521,22 @@ where
 
         match result {
             message::find_value_result::Result::Nodes(res) => {
-                log::debug!("{} rx nodes for value query: {:?}", self.name, query.key);
+                log::debug!(
+                    "{} rx nodes for value query: {:?}",
+                    self.conf.name,
+                    query.key
+                );
                 let nodes = Node::from_vec(res.nodes);
                 self.table.extend(nodes.iter());
 
                 query.feed(nodes, Some(from));
             }
             message::find_value_result::Result::Value(res) => {
-                log::debug!("{} rx value for value query: {:?}", self.name, query.key);
+                log::debug!(
+                    "{} rx value for value query: {:?}",
+                    self.conf.name,
+                    query.key
+                );
 
                 query.finish(QueryValue::Value(res.value));
             }
@@ -513,13 +548,13 @@ where
 
 impl<N> Handler<KadEvtFindNode<N>> for Kad<N>
 where
-    N: KeyLen + Unpin + 'static,
+    N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     type Result = ActorResponse<Self, Option<Node<N>>, Error>;
 
     fn handle(&mut self, msg: KadEvtFindNode<N>, ctx: &mut Context<Self>) -> Self::Result {
-        log::debug!("{} find node request: {}", self.name, msg.key);
+        log::debug!("{} find node request: {}", self.conf.name, msg.key);
 
         if self.me.key == msg.key {
             return ActorResponse::reply(Ok(Some(self.me.clone())));
@@ -545,7 +580,7 @@ where
 
 impl<N> Handler<KadEvtFindValue> for Kad<N>
 where
-    N: KeyLen + Unpin + 'static,
+    N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     type Result = ActorResponse<Self, Option<(Vec<u8>, Vec<u8>)>, Error>;
@@ -553,7 +588,7 @@ where
     fn handle(&mut self, msg: KadEvtFindValue, ctx: &mut Context<Self>) -> Self::Result {
         log::debug!(
             "{} find value request: {}",
-            self.name,
+            self.conf.name,
             Key::<N>::fmt_key(&msg.key)
         );
 
@@ -581,14 +616,14 @@ where
 
 impl<N> Handler<EvtSend<N>> for Kad<N>
 where
-    N: KeyLen + Unpin + 'static,
+    N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     type Result = ActorResponse<Self, (), Error>;
 
     fn handle(&mut self, evt: EvtSend<N>, _: &mut Context<Self>) -> Self::Result {
         // Transform port for non-UDP & fixed-port operating mode?
-        log::trace!("{} tx {} to {}", self.name, evt.message, evt.to);
+        log::trace!("{} tx {} to {}", self.conf.name, evt.message, evt.to);
 
         if evt.message.is_request() {
             self.requests.insert(
@@ -620,7 +655,7 @@ where
 
 impl<N> Handler<EvtAddressChanged> for Kad<N>
 where
-    N: KeyLen + Unpin + 'static,
+    N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     type Result = <EvtAddressChanged as Message>::Result;
@@ -628,231 +663,12 @@ where
     fn handle(&mut self, evt: EvtAddressChanged, _: &mut Context<Self>) -> Self::Result {
         log::debug!(
             "{} address changed from {:?} to {:?}",
-            self.name,
+            self.conf.name,
             self.me.address,
             evt.address
         );
 
         std::mem::replace(&mut self.me.address, evt.address);
         Ok(())
-    }
-}
-
-#[derive(Clone)]
-struct Query<N>
-where
-    N: KeyLen + Unpin + 'static,
-    <N as ArrayLength<u8>>::ArrayType: Unpin,
-{
-    key: QueryKey,
-    kad: Addr<Kad<N>>,
-    node_limit: usize,
-    state: Rc<RefCell<QueryState<N>>>,
-    waker: Option<Waker>,
-}
-
-impl<N> Query<N>
-where
-    N: KeyLen + Unpin + 'static,
-    <N as ArrayLength<u8>>::ArrayType: Unpin,
-{
-    fn new(key: QueryKey, nodes: &Vec<Node<N>>, kad: Addr<Kad<N>>, node_limit: usize) -> Self {
-        let mut query = Query {
-            key,
-            kad,
-            node_limit,
-            state: Rc::new(RefCell::new(QueryState::default())),
-            waker: None,
-        };
-
-        query.feed(nodes.clone(), None);
-        query
-    }
-
-    #[inline(always)]
-    fn in_progress(&self) -> bool {
-        if let QueryState::InProgress { .. } = &*self.state.borrow() {
-            return true;
-        }
-        false
-    }
-
-    fn feed(&mut self, nodes: Vec<Node<N>>, from: Option<&Key<N>>) {
-        let mut iterate = false;
-
-        if let QueryState::InProgress {
-            started_at: _,
-            pending,
-            candidates,
-            sent,
-        } = &mut *self.state.borrow_mut()
-        {
-            if let Some(from) = from {
-                pending.remove(from);
-            }
-
-            *candidates = std::mem::replace(candidates, Vec::new())
-                .into_iter()
-                .chain(nodes.clone().into_iter())
-                .filter(|n| !sent.contains(&n.key))
-                .unique()
-                .sorted_by_key(|n| n.distance(&self.key))
-                .take(self.node_limit)
-                .collect();
-
-            iterate = pending.is_empty();
-        }
-
-        if iterate {
-            self.iterate();
-        }
-    }
-
-    fn iterate(&mut self) {
-        let mut send_out_nodes = None;
-
-        if let QueryState::InProgress {
-            started_at,
-            pending,
-            candidates,
-            sent,
-        } = &mut *self.state.borrow_mut()
-        {
-            if Utc::now().timestamp() - *started_at > MAX_REQ_TTL {
-                pending.clear();
-            }
-
-            if pending.is_empty() {
-                let mut nodes = std::mem::replace(candidates, Vec::new());
-                *candidates = nodes.split_off(std::cmp::min(nodes.len(), ALPHA));
-                *pending = nodes.iter().map(|n| n.key.clone()).collect();
-                *started_at = Utc::now().timestamp();
-
-                sent.extend(pending.clone());
-                send_out_nodes = Some(nodes)
-            }
-        }
-
-        if let Some(nodes) = send_out_nodes {
-            match nodes.is_empty() {
-                true => self.finish(QueryValue::None),
-                false => self.send_out(nodes),
-            }
-        }
-    }
-
-    fn send_out(&mut self, nodes: Vec<Node<N>>) {
-        let address = self.kad.clone();
-        let key = self.key.clone();
-
-        log::debug!(
-            "Querying {} node(s) (key: {})",
-            nodes.len(),
-            Key::<N>::fmt_key(&key)
-        );
-
-        actix_rt::spawn(async move {
-            let mut rand = rand::thread_rng();
-
-            for to in nodes.into_iter() {
-                log::trace!("Send out to: {} (distance: {})", to.key, to.distance(&key));
-
-                let message = match &key {
-                    QueryKey::Node(key) => KadMessage::from(message::FindNode {
-                        rand_val: rand.next_u32(),
-                        key: key.clone(),
-                    }),
-                    QueryKey::Value(key) => KadMessage::from(message::FindValue {
-                        rand_val: rand.next_u32(),
-                        key: key.clone(),
-                    }),
-                };
-
-                if let Err(e) = address.send(EvtSend { to, message }).await {
-                    log::error!("Unable to send query message: {:?}", e);
-                }
-            }
-        });
-    }
-
-    fn finish(&mut self, result: QueryValue<N>) {
-        if self.in_progress() {
-            self.state.replace(QueryState::Finished { result });
-
-            if let Some(waker) = &self.waker {
-                waker.wake_by_ref();
-            }
-        }
-    }
-}
-
-impl<N> Future for Query<N>
-where
-    N: KeyLen + Unpin + 'static,
-    <N as ArrayLength<u8>>::ArrayType: Unpin,
-{
-    type Output = QueryValue<N>;
-
-    #[inline]
-    fn poll(mut self: Pin<&mut Self>, cx: &mut futures::task::Context<'_>) -> Poll<Self::Output> {
-        if let QueryState::Finished { result } = &*self.state.borrow() {
-            return Poll::Ready(result.clone());
-        }
-
-        self.waker.replace(cx.waker().clone());
-        Poll::Pending
-    }
-}
-
-#[derive(Clone, Debug)]
-enum QueryState<N: KeyLen> {
-    InProgress {
-        started_at: i64,
-        pending: HashSet<Key<N>>,
-        candidates: Vec<Node<N>>,
-        sent: HashSet<Key<N>>,
-    },
-    Finished {
-        result: QueryValue<N>,
-    },
-}
-
-impl<N: KeyLen> Default for QueryState<N> {
-    fn default() -> Self {
-        QueryState::InProgress {
-            started_at: Utc::now().timestamp(),
-            pending: HashSet::new(),
-            candidates: Vec::new(),
-            sent: HashSet::new(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) enum QueryValue<N: KeyLen> {
-    Node(Node<N>),
-    Value(Vec<u8>),
-    None,
-}
-
-#[derive(Clone, Debug)]
-enum QueryKey {
-    Node(Vec<u8>),
-    Value(Vec<u8>),
-}
-
-impl QueryKey {
-    pub fn to_vec(&self) -> Vec<u8> {
-        match &self {
-            QueryKey::Node(v) | QueryKey::Value(v) => v.clone(),
-        }
-    }
-}
-
-impl AsRef<[u8]> for QueryKey {
-    fn as_ref(&self) -> &[u8] {
-        match &self {
-            QueryKey::Node(v) | QueryKey::Value(v) => &v,
-        }
     }
 }

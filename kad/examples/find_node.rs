@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::SocketAddr;
 use structopt::StructOpt;
-use ya_net_kad::{event::*, Error};
+use ya_net_kad::{event::*, Error, KadConfig};
 
 type Size = U64;
 
@@ -76,8 +76,8 @@ fn spawn_nodes(
         .map(|n| {
             (
                 n.clone(),
-                Kad::with_name(
-                    format!("B:{}", hex::encode(&n.key.as_ref()[..8])),
+                Kad::with_conf(
+                    KadConfig::with_name(format!("B:{}", hex::encode(&n.key.as_ref()[..8]))),
                     n,
                     tx.clone(),
                 )
@@ -94,8 +94,8 @@ fn spawn_nodes(
         .map(|n| {
             (
                 n.clone(),
-                Kad::with_name(
-                    format!("N:{}", hex::encode(&n.key.as_ref()[..8])),
+                Kad::with_conf(
+                    KadConfig::with_name(format!("N:{}", hex::encode(&n.key.as_ref()[..8]))),
                     n,
                     tx.clone(),
                 )

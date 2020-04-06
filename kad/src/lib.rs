@@ -1,17 +1,21 @@
 pub use key::{Key, KeyLen};
 pub use node::Node;
-pub use service::Kad;
+pub use service::{Kad, KadConfig};
 pub use table::Table;
 
 pub mod event;
 mod key;
 mod node;
+mod query;
 mod service;
 pub mod table;
 
 pub mod message {
     include!(concat!(env!("OUT_DIR"), "/kad.rs"));
 }
+
+// Number of parallel queries
+pub(crate) const ALPHA: usize = 8;
 
 pub type Result<T> = std::result::Result<T, Error>;
 

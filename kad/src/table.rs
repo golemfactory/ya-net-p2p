@@ -2,7 +2,6 @@ use crate::{Key, KeyLen, Node};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const K: usize = 20;
 const BUCKET_REFRESH_INTERVAL: i64 = 3600;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

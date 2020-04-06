@@ -1,16 +1,19 @@
-use generic_array::typenum::U64;
+use generic_array::typenum::{Unsigned, U64};
 use itertools::Itertools;
 use rand::distributions::{Distribution, Uniform};
 use rand::Rng;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use structopt::StructOpt;
-use ya_net_kad::table::K;
 
 type Size = U64;
 type Key = ya_net_kad::Key<Size>;
 type Node = ya_net_kad::Node<Size>;
 type Table = ya_net_kad::Table<Size>;
+
+lazy_static::lazy_static! {
+    static ref K: usize = Size::to_usize();
+}
 
 fn gen_address() -> SocketAddr {
     let mut rng = rand::thread_rng();
@@ -53,9 +56,9 @@ fn gen_nodes(count: usize) -> HashSet<Node> {
 }
 
 fn find_neighbors(key: &Key, nodes: &HashSet<Node>, rn: &Node) -> Vec<Node> {
-    let mut table = Table::new(key.clone(), K);
+    let mut table = Table::new(key.clone(), *K);
     table.extend(nodes.iter());
-    table.neighbors(&rn.key, None, Some(K))
+    table.neighbors(&rn.key, None, Some(*K))
 }
 
 fn dbg_nodes(me: &Key, rn: &Node, sorted: &Vec<Node>, neighbors: &Vec<Node>, limit: Option<usize>) {
@@ -97,7 +100,7 @@ fn main() {
         .iter()
         .sorted_by_key(|p| rand_node.distance(&p))
         .cloned()
-        .take(K)
+        .take(*K)
         .collect::<Vec<_>>();
 
     println!("Searched key: {}", rand_node.key);
