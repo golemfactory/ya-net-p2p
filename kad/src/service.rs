@@ -419,7 +419,7 @@ where
         msg: message::FindNodeResult,
         from: &Key<N>,
     ) -> impl Future<Output = HandleMsgResult> {
-        let nodes = Node::from_vec(msg.nodes);
+        let mut nodes = Node::from_vec(msg.nodes);
         let fut = async move { Ok(None) }.right_future();
 
         match self.find_query(msg.rand_val) {
@@ -439,7 +439,8 @@ where
                 self.table.extend(nodes.iter());
 
                 if query.key.as_ref() == self.me.key.as_ref() {
-                    query.feed(self.table.distant_nodes(&self.me.key), Some(from));
+                    nodes.extend(self.table.distant_nodes(&self.me.key).into_iter());
+                    query.feed(nodes, Some(from));
                 } else {
                     let node_idx = nodes
                         .iter()

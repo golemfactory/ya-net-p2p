@@ -1,7 +1,6 @@
 use actix::prelude::*;
 use futures::channel::mpsc;
 use futures::StreamExt;
-use generic_array::typenum::U64;
 use rand::distributions::{Distribution, Uniform};
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
@@ -10,7 +9,7 @@ use std::net::SocketAddr;
 use structopt::StructOpt;
 use ya_net_kad::{event::*, Error, KadConfig};
 
-type Size = U64;
+type Size = generic_array::typenum::U16;
 
 type Key = ya_net_kad::Key<Size>;
 type Node = ya_net_kad::Node<Size>;
@@ -129,17 +128,13 @@ async fn bootstrap(
 
     let mut futs = Vec::new();
 
-    // FIXME: better initialization
-    for _ in 0..3 {
-        for (_, addr) in nodes.iter() {
-            futs.push(addr.send(KadEvtBootstrap {
-                nodes: init_vec.clone(),
-                dormant: false,
-            }));
+    for (_, addr) in nodes.iter() {
+        futs.push(addr.send(KadEvtBootstrap {
+            nodes: init_vec.clone(),
+            dormant: false,
+        }));
 
-            delay_for(Duration::from_millis(2)).await;
-        }
-        delay_for(Duration::from_millis(500)).await;
+        delay_for(Duration::from_millis(2)).await;
     }
 
     futures::future::join_all(futs).await;
