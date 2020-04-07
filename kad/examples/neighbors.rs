@@ -1,4 +1,4 @@
-use generic_array::typenum::{Unsigned, U64};
+use generic_array::typenum::Unsigned;
 use itertools::Itertools;
 use rand::distributions::{Distribution, Uniform};
 use rand::Rng;
@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use structopt::StructOpt;
 
-type Size = U64;
+type Size = generic_array::typenum::U32;
 type Key = ya_net_kad::Key<Size>;
 type Node = ya_net_kad::Node<Size>;
 type Table = ya_net_kad::Table<Size>;
@@ -67,10 +67,10 @@ fn dbg_nodes(me: &Key, rn: &Node, sorted: &Vec<Node>, neighbors: &Vec<Node>, lim
         .sorted_by_key(|p| rn.distance(&p))
         .zip(neighbors.iter().sorted_by_key(|p| rn.distance(&p)))
         .enumerate()
-        .take(limit.unwrap_or(5))
+        .take(limit.unwrap_or(*K))
         .for_each(|(i, (n1, n2))| {
             println!(
-                "[{:>5}] srt: {} (distance {} | me: {})\n[{:>5}] kad: {} (distance {} | me: {})\n",
+                "[{:>5}] srt: {} (distance {} | me: {})\n[{:>5}] kad: {} (distance {} | me: {})",
                 i,
                 n1.key,
                 rn.distance(&n1),
