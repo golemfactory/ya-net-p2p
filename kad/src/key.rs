@@ -144,7 +144,7 @@ mod test {
     type Size = U128;
 
     #[test]
-    fn leading_zeros() {
+    fn rand_key_leading_zeros() {
         for i in 0..(Size::to_usize() * 8) {
             let key = Key::<Size>::random(i);
             assert_eq!(key.leading_zeros(), i);

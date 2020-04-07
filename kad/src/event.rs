@@ -27,12 +27,6 @@ pub struct KadEvtFindNode<N: KeyLen + 'static> {
 }
 
 #[derive(Clone, Debug, Message, Deserialize, Serialize)]
-#[rtype(result = "Result<Option<(Vec<u8>, Vec<u8>)>>")]
-pub struct KadEvtFindValue {
-    pub key: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Message, Deserialize, Serialize)]
 #[rtype(result = "Result<()>")]
 pub struct KadEvtBootstrap<N: KeyLen> {
     pub nodes: Vec<Node<N>>,
@@ -87,17 +81,14 @@ macro_rules! kad_message {
 kad_message! {
     Ping,
     Pong,
-    Store,
     FindNode,
-    FindNodeResult,
-    FindValue,
-    FindValueResult
+    FindNodeResult
 }
 
 impl KadMessage {
     pub fn is_request(&self) -> bool {
         match &self {
-            KadMessage::Ping(_) | KadMessage::FindValue(_) | KadMessage::FindNode(_) => true,
+            KadMessage::Ping(_) | KadMessage::FindNode(_) => true,
             _ => false,
         }
     }
@@ -105,7 +96,6 @@ impl KadMessage {
     pub fn queried_key(&self) -> Option<Vec<u8>> {
         match &self {
             KadMessage::FindNode(m) => Some(m.key.clone()),
-            KadMessage::FindValue(m) => Some(m.key.clone()),
             _ => None,
         }
     }

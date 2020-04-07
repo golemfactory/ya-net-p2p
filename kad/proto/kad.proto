@@ -24,12 +24,6 @@ message Pong {
     uint32 rand_val = 1;
 }
 
-message Store {
-    uint32 rand_val = 1;
-    bytes key = 2;
-    Value value = 3;
-}
-
 message FindNode {
     uint32 rand_val = 1;
     bytes key = 2;
@@ -40,25 +34,6 @@ message FindNodeResult {
     repeated Node nodes = 2;
 }
 
-message FindValue {
-    uint32 rand_val = 1;
-    bytes key = 2;
-}
-
-message FindValueResult {
-    uint32 rand_val = 1;
-
-    oneof result {
-        Nodes nodes = 2;
-        Value value = 3;
-    }
-}
-
 message Nodes {
     repeated Node nodes = 1;
-}
-
-message Value {
-    bytes value = 1;
-    uint32 ttl = 2;
 }

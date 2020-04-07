@@ -19,7 +19,7 @@ where
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     uid: usize,
-    pub key: QueryKey,
+    pub key: Vec<u8>,
     kad: Addr<Kad<N>>,
     node_limit: usize,
     req_ttl: i64,
@@ -33,7 +33,7 @@ where
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     pub fn new(
-        key: QueryKey,
+        key: Vec<u8>,
         nodes: &Vec<Node<N>>,
         kad: Addr<Kad<N>>,
         node_limit: usize,
@@ -133,7 +133,7 @@ where
                 .borrow_mut()
                 .waker_map
                 .values()
-                .for_each(|w| w.wake_by_ref());
+                .for_each(Waker::wake_by_ref);
         }
     }
 
@@ -153,16 +153,10 @@ where
             for to in nodes.into_iter() {
                 log::trace!("Send out to: {} (distance: {})", to.key, to.distance(&key));
 
-                let message = match &key {
-                    QueryKey::Node(key) => KadMessage::from(message::FindNode {
-                        rand_val: rand.next_u32(),
-                        key: key.clone(),
-                    }),
-                    QueryKey::Value(key) => KadMessage::from(message::FindValue {
-                        rand_val: rand.next_u32(),
-                        key: key.clone(),
-                    }),
-                };
+                let message = KadMessage::from(message::FindNode {
+                    rand_val: rand.next_u32(),
+                    key: key.clone(),
+                });
 
                 if let Err(e) = address.send(EvtSend { to, message }).await {
                     log::error!("Unable to send query message: {:?}", e);
@@ -263,30 +257,7 @@ impl Default for QueryFutureState {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum QueryKey {
-    Node(Vec<u8>),
-    Value(Vec<u8>),
-}
-
-impl QueryKey {
-    pub fn to_vec(&self) -> Vec<u8> {
-        match &self {
-            QueryKey::Node(v) | QueryKey::Value(v) => v.clone(),
-        }
-    }
-}
-
-impl AsRef<[u8]> for QueryKey {
-    fn as_ref(&self) -> &[u8] {
-        match &self {
-            QueryKey::Node(v) | QueryKey::Value(v) => &v,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
 pub(crate) enum QueryValue<N: KeyLen> {
     Node(Node<N>),
-    Value(Vec<u8>),
     None,
 }
