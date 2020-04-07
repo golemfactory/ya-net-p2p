@@ -91,18 +91,19 @@ impl<N: KeyLen + 'static> Table<N> {
                         .as_ref()
                         .iter()
                         .filter(|n| Some(&n.key) != excluded)
-                        .take(2 * max - acc)
+                        .take(max - acc)
                         .cloned(),
                 );
-                if result.len() == max * 2 {
-                    return Err(());
+
+                if result.len() == max {
+                    Err(())
+                } else {
+                    Ok(result.len())
                 }
-                Ok(result.len())
             },
         );
 
         result.sort_by_key(|n| key.distance(n));
-        result.truncate(max);
         result
     }
 
@@ -285,5 +286,40 @@ impl<N: KeyLen> Bucket<N> {
 impl<N: KeyLen> AsRef<[Node<N>]> for Bucket<N> {
     fn as_ref(&self) -> &[Node<N>] {
         &self.nodes
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn iter() {
+        fn gather(iter: impl Iterator<Item = usize>, vec: &Vec<[i32; 3]>) -> Vec<i32> {
+            iter.map(|i| vec.get(i).unwrap())
+                .flatten()
+                .cloned()
+                .collect()
+        }
+
+        let vec: Vec<[i32; 3]> = vec![];
+        let iter = AlternatingIter::new(0, vec.len());
+        assert_eq!(vec![0], iter.collect::<Vec<_>>());
+
+        let vec = vec![[1, 2, 3]];
+        let iter = AlternatingIter::new(0, vec.len());
+        assert_eq!(gather(iter, &vec), (1..4).collect::<Vec<_>>());
+
+        let vec = vec![[1, 2, 3], [4, 5, 6]];
+        let iter = AlternatingIter::new(0, vec.len());
+        assert_eq!(gather(iter, &vec), (1..7).collect::<Vec<_>>());
+
+        let vec = vec![[4, 5, 6], [1, 2, 3]];
+        let iter = AlternatingIter::new(1, vec.len());
+        assert_eq!(gather(iter, &vec), (1..7).collect::<Vec<_>>());
+
+        let vec = vec![[13, 14, 15], [7, 8, 9], [1, 2, 3], [4, 5, 6], [10, 11, 12]];
+        let iter = AlternatingIter::new(2, vec.len());
+        assert_eq!(gather(iter, &vec), (1..16).collect::<Vec<_>>());
     }
 }
