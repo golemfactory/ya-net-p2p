@@ -63,15 +63,11 @@ impl<N: KeyLen> Key<N> {
         let result = self.inner.iter().try_fold(0 as usize, |acc, b| {
             let zeros = b.leading_zeros() as usize;
             let next = acc + zeros;
-            match next % 8 {
-                0 => {
-                    if zeros < 8 {
-                        Err(next)
-                    } else {
-                        Ok(next)
-                    }
-                }
-                _ => Err(next),
+
+            if zeros < 8 {
+                Err(next)
+            } else {
+                Ok(next)
             }
         });
 
