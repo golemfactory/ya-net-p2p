@@ -6,18 +6,22 @@ use chrono::Utc;
 use futures::channel::mpsc;
 use futures::{Future, FutureExt, SinkExt};
 use generic_array::ArrayLength;
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
+use rand::RngCore;
 use std::convert::TryFrom;
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub struct KadConfig {
     pub name: String,
-    pub req_ttl: i64,
-    pub qry_ttl: i64,
-    pub req_upkeep_freq: Duration,
-    pub qry_upkeep_freq: Duration,
-    pub tab_upkeep_freq: Duration,
+    pub request_ttl: i64,
+    pub query_ttl: i64,
+    pub request_upkeep_freq: Duration,
+    pub query_upkeep_freq: Duration,
+    pub table_upkeep_freq: Duration,
+    pub ping_freq: Duration,
+    pub ping_backlog_sz: usize,
+    pub ping_limit: usize,
 }
 
 impl KadConfig {
@@ -32,11 +36,14 @@ impl Default for KadConfig {
     fn default() -> Self {
         KadConfig {
             name: "Kad".to_owned(),
-            req_ttl: 5,
-            qry_ttl: 30,
-            req_upkeep_freq: Duration::from_secs(2),
-            qry_upkeep_freq: Duration::from_secs(3),
-            tab_upkeep_freq: Duration::from_secs(60),
+            request_ttl: 5,
+            query_ttl: 30,
+            request_upkeep_freq: Duration::from_secs(2),
+            query_upkeep_freq: Duration::from_secs(3),
+            table_upkeep_freq: Duration::from_secs(60),
+            ping_freq: Duration::from_secs(10),
+            ping_backlog_sz: 100,
+            ping_limit: 25,
         }
     }
 }
@@ -51,6 +58,7 @@ where
     table: Table<N>,
     queries: HashMap<Vec<u8>, (Query<N>, i64)>,
     requests: HashMap<u32, (KadMessage, Key<N>, i64)>,
+    pings: HashSet<Node<N>>,
     tx: mpsc::Sender<KadEvtSend<N>>,
 }
 
@@ -71,6 +79,7 @@ where
             table: Table::new(key, N::to_usize()),
             queries: HashMap::new(),
             requests: HashMap::new(),
+            pings: HashSet::new(),
             tx,
         }
     }
@@ -78,7 +87,7 @@ where
     #[inline]
     fn request_upkeep(&mut self, _: &mut Context<Self>) {
         let mut to_remove = HashSet::new();
-        let ttl = self.conf.req_ttl;
+        let ttl = self.conf.request_ttl;
         let now = Utc::now().timestamp();
 
         self.requests.retain(|_, (_, key, created_at)| {
@@ -95,7 +104,7 @@ where
 
     #[inline]
     fn query_upkeep(&mut self, _: &mut Context<Self>) {
-        let ttl = self.conf.qry_ttl;
+        let ttl = self.conf.query_ttl;
         let now = Utc::now().timestamp();
 
         self.queries.retain(|_, (query, created_at)| {
@@ -124,6 +133,43 @@ where
             self.initiate_query(key.to_vec(), neighbors, address.clone());
         });
     }
+
+    #[inline]
+    fn node_upkeep(&mut self, ctx: &mut Context<Self>) {
+        let address = ctx.address();
+        let mut count = 0;
+        let max = self.conf.ping_limit;
+
+        let mut events = Vec::new();
+        let mut pings = HashSet::new();
+
+        self.pings.drain().for_each(|node| {
+            if count < max {
+                count += 1;
+                events.push(EvtSend::new(
+                    node,
+                    KadMessage::from(message::Ping {
+                        rand_val: rand::thread_rng().next_u32(),
+                    }),
+                ));
+            } else {
+                pings.insert(node);
+            }
+        });
+
+        std::mem::replace(&mut self.pings, pings);
+
+        ctx.spawn(
+            async move {
+                for evt in events.into_iter() {
+                    if let Err(e) = address.send(evt).await {
+                        log::warn!("Unable to ping node: {:?}", e);
+                    }
+                }
+            }
+            .into_actor(self),
+        );
+    }
 }
 
 impl<N> Kad<N>
@@ -135,7 +181,7 @@ where
         let mut nodes = self.table.neighbors(&key, excluded, None);
         if key == &self.me.key {
             if nodes.len() == self.table.bucket_size {
-                nodes.remove(nodes.len() - 1);
+                nodes.pop();
             }
             nodes.insert(0, self.me.clone());
         }
@@ -179,7 +225,7 @@ where
                     &nodes,
                     address,
                     self.table.bucket_size,
-                    self.conf.req_ttl,
+                    self.conf.request_ttl,
                 ),
                 Utc::now().timestamp(),
             ))
@@ -199,13 +245,16 @@ where
     type Context = Context<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        IntervalFunc::new(self.conf.qry_upkeep_freq, Self::query_upkeep)
+        IntervalFunc::new(self.conf.query_upkeep_freq, Self::query_upkeep)
             .finish()
             .spawn(ctx);
-        IntervalFunc::new(self.conf.req_upkeep_freq, Self::request_upkeep)
+        IntervalFunc::new(self.conf.request_upkeep_freq, Self::request_upkeep)
             .finish()
             .spawn(ctx);
-        IntervalFunc::new(self.conf.tab_upkeep_freq, Self::table_upkeep)
+        IntervalFunc::new(self.conf.table_upkeep_freq, Self::table_upkeep)
+            .finish()
+            .spawn(ctx);
+        IntervalFunc::new(self.conf.ping_freq, Self::node_upkeep)
             .finish()
             .spawn(ctx);
 
@@ -232,8 +281,7 @@ where
             }
             .left_future()
         } else {
-            let query = self.initiate_query(self.me.key.to_vec(), msg.nodes.clone(), ctx.address());
-
+            let query = self.initiate_query(self.me.key.to_vec(), msg.nodes, ctx.address());
             async move {
                 query.await;
                 Ok(())
@@ -258,25 +306,10 @@ where
         let address = ctx.address();
         let (from, _new, msg) = (evt.from, evt.new, evt.message);
 
-        let evt_opt = if !self.table.add(&from) {
-            // match self.table.bucket_oldest(&from.key) {
-            //     Some(node) => {
-            //         if from.key != node.key {
-            //             Some(EvtSend::new(
-            //                 node,
-            //                 KadMessage::from(message::Ping {
-            //                     rand_val: rand::thread_rng().next_u32(),
-            //                 }),
-            //             ))
-            //         } else {
-            //             None
-            //         }
-            //     }
-            //     _ => None,
-            // }
-            Option::<EvtSend<N>>::None
-        } else {
-            None
+        if !self.table.add(&from) && self.pings.len() < self.conf.ping_backlog_sz {
+            if let Some(node) = self.table.bucket_oldest(&from.key) {
+                self.pings.insert(node);
+            }
         };
 
         let handler_fut = match msg {
@@ -287,9 +320,6 @@ where
         };
 
         let fut = async move {
-            if let Some(evt) = evt_opt {
-                address.send(evt).await??;
-            }
             if let Some(msg) = handler_fut.await? {
                 address.send(EvtSend::new(from, msg)).await??;
             }
