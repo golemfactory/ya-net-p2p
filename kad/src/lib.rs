@@ -1,4 +1,4 @@
-pub use key::{Key, KeyLen};
+pub use key::{Key, KeyLen, lengths as key_lengths};
 pub use node::Node;
 pub use service::{Kad, KadConfig};
 pub use table::Table;

@@ -9,6 +9,10 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::iter::FromIterator;
 
+pub mod lengths {
+    pub use generic_array::typenum::{U8, U16, U32, U64, U128, U256, U512};
+}
+
 pub trait KeyLen: ArrayLength<u8> + Debug + Unpin + Clone + Ord + Hash {}
 impl<N> KeyLen for N where N: ArrayLength<u8> + Debug + Unpin + Clone + Ord + Hash {}
 
@@ -18,28 +22,6 @@ pub struct Key<N: KeyLen> {
 }
 
 impl<N: KeyLen> Key<N> {
-    pub fn random(leading_zeros: usize) -> Self {
-        let mut rng = rand::thread_rng();
-
-        let n = N::to_usize();
-        let z = leading_zeros / 8;
-        let x = (rng.gen::<u8>() >> (leading_zeros % 8) as u8)
-            | (1u8 << (8 - 1 - (leading_zeros % 8)) as u8);
-
-        let inner = if z >= n {
-            GenericArray::<u8, N>::from_iter(std::iter::repeat(0u8).take(n))
-        } else {
-            GenericArray::<u8, N>::from_iter(
-                std::iter::repeat(0u8)
-                    .take(z)
-                    .chain(std::iter::once(x))
-                    .chain((0..(n - z - 1)).map(|_| rng.gen::<u8>())),
-            )
-        };
-
-        Self { inner }
-    }
-
     pub fn distance<O: AsRef<[u8]>>(&self, other: &O) -> Self {
         let other = other.as_ref();
         let l = other.len();
@@ -51,7 +33,7 @@ impl<N: KeyLen> Key<N> {
             GenericArray::<u8, N>::from_iter(
                 self.inner
                     .iter()
-                    .zip(std::iter::repeat(&0u8).take(n - l).chain(other.iter()))
+                    .zip(std::iter::repeat(&0xff).take(n - l).chain(other.iter()))
                     .map(|(f, s)| f ^ s),
             )
         };
@@ -76,11 +58,36 @@ impl<N: KeyLen> Key<N> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn to_vec(&self) -> Vec<u8> {
         self.as_ref().to_vec()
     }
+}
 
+impl<N: KeyLen> Key<N> {
+    pub fn random(leading_zeros: usize) -> Self {
+        let mut rng = rand::thread_rng();
+
+        let n = N::to_usize();
+        let z = leading_zeros / 8;
+
+        let inner = if z >= n {
+            GenericArray::<u8, N>::from_iter(std::iter::repeat(0u8).take(n))
+        } else {
+            let x = (rng.gen::<u8>() >> (leading_zeros % 8) as u8)
+                | (1u8 << (8 - 1 - (leading_zeros % 8)) as u8);
+
+            GenericArray::<u8, N>::from_iter(
+                std::iter::repeat(0u8)
+                    .take(z)
+                    .chain(std::iter::once(x))
+                    .chain((0..(n - z - 1)).map(|_| rng.gen::<u8>())),
+            )
+        };
+
+        Self { inner }
+    }
+    
     #[inline]
     pub fn fmt_key<K: AsRef<[u8]>>(key: K) -> String {
         let r = key.as_ref();
@@ -137,12 +144,10 @@ mod test {
     use super::*;
     use generic_array::typenum::{Unsigned, U128};
 
-    type Size = U128;
-
     #[test]
     fn rand_key_leading_zeros() {
-        for i in 0..(Size::to_usize() * 8) {
-            let key = Key::<Size>::random(i);
+        for i in 0..(U128::to_usize() * 8) {
+            let key = Key::<U128>::random(i);
             assert_eq!(key.leading_zeros(), i);
         }
     }

@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use structopt::StructOpt;
 
-type Size = generic_array::typenum::U32;
+type Size = ya_net_kad::key_lengths::U32;
 type Key = ya_net_kad::Key<Size>;
 type Node = ya_net_kad::Node<Size>;
 type Table = ya_net_kad::Table<Size>;

@@ -9,8 +9,7 @@ use std::net::SocketAddr;
 use structopt::StructOpt;
 use ya_net_kad::{event::*, Error, KadConfig};
 
-type Size = generic_array::typenum::U16;
-
+type Size = ya_net_kad::key_lengths::U32;
 type Key = ya_net_kad::Key<Size>;
 type Node = ya_net_kad::Node<Size>;
 type Kad = ya_net_kad::Kad<Size>;
