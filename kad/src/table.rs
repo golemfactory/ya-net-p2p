@@ -8,15 +8,21 @@ const BUCKET_REFRESH_INTERVAL: i64 = 3600;
 pub struct Table<N: KeyLen> {
     pub key: Key<N>,
     buckets: Vec<Bucket<N>>,
+    pub table_size: usize,
     pub bucket_size: usize,
 }
 
 impl<N: KeyLen + 'static> Table<N> {
-    pub fn new(key: Key<N>, bucket_size: usize) -> Self {
+    pub fn new(key: Key<N>) -> Self {
+        Self::with_size(key, N::to_usize() * 8, N::to_usize())
+    }
+
+    pub fn with_size(key: Key<N>, table_size: usize, bucket_size: usize) -> Self {
         let buckets = vec![Bucket::new(bucket_size)];
         Table {
             key,
             buckets,
+            table_size,
             bucket_size,
         }
     }
@@ -42,7 +48,7 @@ impl<N: KeyLen + 'static> Table<N> {
             bucket.queue.push(node.clone());
             false
         // table full
-        } else if len == N::to_usize() * 8 {
+        } else if len == self.table_size {
             false
         // split the last bucket
         } else {

@@ -76,7 +76,7 @@ where
         Self {
             conf,
             me,
-            table: Table::new(key, N::to_usize()),
+            table: Table::new(key),
             queries: HashMap::new(),
             requests: HashMap::new(),
             pings: HashSet::new(),

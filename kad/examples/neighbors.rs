@@ -56,7 +56,7 @@ fn gen_nodes(count: usize) -> HashSet<Node> {
 }
 
 fn find_neighbors(key: &Key, nodes: &HashSet<Node>, rn: &Node) -> Vec<Node> {
-    let mut table = Table::new(key.clone(), *K);
+    let mut table = Table::new(key.clone());
     table.extend(nodes.iter());
     table.neighbors(&rn.key, None, Some(*K))
 }
