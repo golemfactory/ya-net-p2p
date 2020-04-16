@@ -1,4 +1,4 @@
-pub use key::{Key, KeyLen, lengths as key_lengths};
+pub use key::{lengths as key_lengths, Key, KeyLen};
 pub use node::Node;
 pub use service::{Kad, KadConfig};
 pub use table::Table;
@@ -8,7 +8,7 @@ mod key;
 mod node;
 mod query;
 mod service;
-pub mod table;
+mod table;
 
 pub mod message {
     include!(concat!(env!("OUT_DIR"), "/kad.rs"));

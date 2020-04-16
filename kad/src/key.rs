@@ -10,7 +10,7 @@ use std::hash::Hash;
 use std::iter::FromIterator;
 
 pub mod lengths {
-    pub use generic_array::typenum::{U8, U16, U32, U64, U128, U256, U512};
+    pub use generic_array::typenum::*;
 }
 
 pub trait KeyLen: ArrayLength<u8> + Debug + Unpin + Clone + Ord + Hash {}
@@ -57,6 +57,36 @@ impl<N: KeyLen> Key<N> {
             Ok(v) | Err(v) => v,
         }
     }
+}
+
+impl<N: KeyLen> Key<N> {
+    pub fn add_prefix<'l, M: KeyLen, I: Iterator<Item = &'l u8>>(
+        &self,
+        iter: I,
+    ) -> Result<Key<M>, Error> {
+        let prefix = iter.cloned().collect::<Vec<_>>();
+        let len = N::to_usize() + prefix.len();
+        if len != M::to_usize() {
+            return Err(Error::InvalidKeyLength(len));
+        }
+
+        Ok(Key {
+            inner: GenericArray::<u8, M>::from_iter(
+                prefix.into_iter().chain(self.as_ref().iter().cloned()),
+            ),
+        })
+    }
+
+    pub fn remove_prefix<M: KeyLen>(&self, size: usize) -> Result<Key<M>, Error> {
+        let len = N::to_usize() - size;
+        if len != M::to_usize() {
+            return Err(Error::InvalidKeyLength(len));
+        }
+
+        Ok(Key {
+            inner: GenericArray::<u8, M>::from_iter(self.as_ref().iter().skip(size).cloned()),
+        })
+    }
 
     #[inline(always)]
     pub fn to_vec(&self) -> Vec<u8> {
@@ -87,7 +117,7 @@ impl<N: KeyLen> Key<N> {
 
         Self { inner }
     }
-    
+
     #[inline]
     pub fn fmt_key<K: AsRef<[u8]>>(key: K) -> String {
         let r = key.as_ref();
@@ -141,14 +171,34 @@ impl<N: KeyLen> std::fmt::Display for Key<N> {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use generic_array::typenum::{Unsigned, U128};
+    use super::{lengths, lengths::Unsigned, Key};
 
     #[test]
     fn rand_key_leading_zeros() {
-        for i in 0..(U128::to_usize() * 8) {
-            let key = Key::<U128>::random(i);
+        for i in 0..(lengths::U128::to_usize() * 8) {
+            let key = Key::<lengths::U128>::random(i);
             assert_eq!(key.leading_zeros(), i);
         }
+    }
+
+    #[test]
+    fn add_remove_prefix() {
+        let key = Key::<lengths::U32>::random(0);
+
+        assert!(key.add_prefix::<lengths::U32, _>([1u8].iter()).is_err());
+        assert!(key.add_prefix::<lengths::U33, _>([1u8, 2].iter()).is_err());
+        assert!(key.add_prefix::<lengths::U36, _>([1u8, 2].iter()).is_err());
+
+        assert!(key.add_prefix::<lengths::U32, _>([0u8; 0].iter()).is_ok());
+        let key_ext = key
+            .add_prefix::<lengths::U36, _>([1u8, 2, 3, 4].iter())
+            .unwrap();
+
+        assert!(key_ext.remove_prefix::<lengths::U32>(3).is_err());
+        assert!(key_ext.remove_prefix::<lengths::U32>(5).is_err());
+
+        assert!(key_ext.remove_prefix::<lengths::U32>(4).is_ok());
+        assert!(key_ext.remove_prefix::<lengths::U33>(3).is_ok());
+        assert!(key_ext.remove_prefix::<lengths::U36>(0).is_ok());
     }
 }
