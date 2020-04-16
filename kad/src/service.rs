@@ -137,27 +137,21 @@ where
     #[inline]
     fn node_upkeep(&mut self, ctx: &mut Context<Self>) {
         let address = ctx.address();
-        let mut count = 0;
-        let max = self.conf.ping_limit;
-
         let mut events = Vec::new();
-        let mut pings = HashSet::new();
 
-        self.pings.drain().for_each(|node| {
-            if count < max {
-                count += 1;
-                events.push(EvtSend::new(
+        std::mem::replace(&mut self.pings, HashSet::new())
+            .drain()
+            .for_each(|node| match events.len() < self.conf.ping_limit {
+                true => events.push(EvtSend::new(
                     node,
                     KadMessage::from(message::Ping {
                         rand_val: rand::thread_rng().next_u32(),
                     }),
-                ));
-            } else {
-                pings.insert(node);
-            }
-        });
-
-        std::mem::replace(&mut self.pings, pings);
+                )),
+                false => {
+                    self.pings.insert(node);
+                }
+            });
 
         ctx.spawn(
             async move {
