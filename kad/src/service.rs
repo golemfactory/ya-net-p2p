@@ -210,19 +210,18 @@ where
             return query.clone();
         }
 
+        let bucket_size = self.table.bucket_size;
+        let request_ttl = self.conf.request_ttl;
+
         let mut query = self
             .queries
             .entry(key.to_vec())
-            .or_insert((
-                Query::new(
-                    key,
-                    &nodes,
-                    address,
-                    self.table.bucket_size,
-                    self.conf.request_ttl,
-                ),
-                Utc::now().timestamp(),
-            ))
+            .or_insert_with(|| {
+                (
+                    Query::new(key, &nodes, address, bucket_size, request_ttl),
+                    Utc::now().timestamp(),
+                )
+            })
             .0
             .clone();
 
