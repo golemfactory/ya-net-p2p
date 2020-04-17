@@ -1,4 +1,4 @@
-use crate::event::{EvtSend, KadMessage};
+use crate::event::{EvtRequest, KadMessage};
 use crate::message;
 use crate::{Kad, Key, KeyLen, Node, ALPHA};
 use actix::prelude::*;
@@ -7,7 +7,6 @@ use futures::task::{Poll, Waker};
 use generic_array::ArrayLength;
 use hashbrown::{HashMap, HashSet};
 use itertools::Itertools;
-use rand::RngCore;
 use std::cell::RefCell;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -149,24 +148,21 @@ where
         );
 
         actix_rt::spawn(async move {
-            let mut rand = rand::thread_rng();
-
             for to in nodes.into_iter() {
                 log::trace!("Send out to: {} (distance: {})", to.key, to.distance(&key));
 
-                let rand_val = rand.next_u32();
                 let message = match &key {
                     QueryKey::Node(key) => KadMessage::from(message::FindNode {
-                        rand_val,
+                        rand_val: 0,
                         key: key.clone(),
                     }),
                     QueryKey::Value(key) => KadMessage::from(message::FindValue {
-                        rand_val,
+                        rand_val: 0,
                         key: key.clone(),
                     }),
                 };
 
-                if let Err(e) = address.send(EvtSend { to, message }).await {
+                if let Err(e) = address.send(EvtRequest { to, message }).await {
                     log::error!("Unable to send query message: {:?}", e);
                 }
             }

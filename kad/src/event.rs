@@ -41,7 +41,14 @@ pub struct KadEvtBootstrap<N: KeyLen> {
 
 #[derive(Clone, Debug, Message)]
 #[rtype(result = "Result<()>")]
-pub(crate) struct EvtSend<N: KeyLen> {
+pub(crate) struct EvtRespond<N: KeyLen> {
+    pub to: Node<N>,
+    pub message: KadMessage,
+}
+
+#[derive(Clone, Debug, Message)]
+#[rtype(result = "Result<()>")]
+pub(crate) struct EvtRequest<N: KeyLen> {
     pub to: Node<N>,
     pub message: KadMessage,
 }
@@ -67,6 +74,14 @@ macro_rules! kad_message {
                 match &self {
                     $(
                         KadMessage::$ident(m) => m.rand_val,
+                    )*
+                }
+            }
+
+            pub fn set_rand_val(&mut self, rand_val: u32) {
+                match self {
+                    $(
+                        KadMessage::$ident(m) => m.rand_val = rand_val,
                     )*
                 }
             }
@@ -108,13 +123,6 @@ kad_message! {
 }
 
 impl KadMessage {
-    pub fn is_request(&self) -> bool {
-        match &self {
-            KadMessage::Ping(_) | KadMessage::FindValue(_) | KadMessage::FindNode(_) => true,
-            _ => false,
-        }
-    }
-
     pub fn into_key(self) -> Option<Vec<u8>> {
         match self {
             KadMessage::FindNode(m) => Some(m.key),
