@@ -27,10 +27,29 @@ pub struct KadEvtFindNode<N: KeyLen + 'static> {
 }
 
 #[derive(Clone, Debug, Message, Deserialize, Serialize)]
+#[rtype(result = "Result<Option<(Vec<u8>, Vec<u8>)>>")]
+pub struct KadEvtFindValue {
+    pub key: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Message, Deserialize, Serialize)]
 #[rtype(result = "Result<()>")]
 pub struct KadEvtBootstrap<N: KeyLen> {
     pub nodes: Vec<Node<N>>,
     pub dormant: bool,
+}
+
+#[derive(Clone, Debug, Message)]
+#[rtype(result = "Result<()>")]
+pub(crate) struct EvtSend<N: KeyLen> {
+    pub to: Node<N>,
+    pub message: KadMessage,
+}
+
+#[derive(Clone, Debug, Message)]
+#[rtype(result = "Result<()>")]
+pub(crate) struct EvtAddressChanged {
+    pub address: SocketAddr,
 }
 
 macro_rules! kad_message {
@@ -81,41 +100,26 @@ macro_rules! kad_message {
 kad_message! {
     Ping,
     Pong,
+    Store,
     FindNode,
-    FindNodeResult
+    FindNodeResult,
+    FindValue,
+    FindValueResult
 }
 
 impl KadMessage {
     pub fn is_request(&self) -> bool {
         match &self {
-            KadMessage::Ping(_) | KadMessage::FindNode(_) => true,
+            KadMessage::Ping(_) | KadMessage::FindValue(_) | KadMessage::FindNode(_) => true,
             _ => false,
         }
     }
 
-    pub fn queried_key(&self) -> Option<Vec<u8>> {
-        match &self {
-            KadMessage::FindNode(m) => Some(m.key.clone()),
+    pub fn into_key(self) -> Option<Vec<u8>> {
+        match self {
+            KadMessage::FindNode(m) => Some(m.key),
+            KadMessage::FindValue(m) => Some(m.key),
             _ => None,
         }
-    }
-}
-
-#[derive(Clone, Debug, Message)]
-#[rtype(result = "Result<()>")]
-pub(crate) struct EvtAddressChanged {
-    pub address: SocketAddr,
-}
-
-#[derive(Clone, Debug, Message)]
-#[rtype(result = "Result<()>")]
-pub(crate) struct EvtSend<N: KeyLen> {
-    pub to: Node<N>,
-    pub message: KadMessage,
-}
-
-impl<N: KeyLen> EvtSend<N> {
-    pub fn new(to: Node<N>, message: KadMessage) -> Self {
-        Self { to, message }
     }
 }

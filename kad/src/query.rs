@@ -1,5 +1,6 @@
 use crate::event::{EvtSend, KadMessage};
-use crate::{message, Kad, Key, KeyLen, Node, ALPHA};
+use crate::message;
+use crate::{Kad, Key, KeyLen, Node, ALPHA};
 use actix::prelude::*;
 use chrono::Utc;
 use futures::task::{Poll, Waker};
@@ -18,11 +19,11 @@ where
     N: KeyLen + Unpin + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
-    uid: usize,
-    pub key: Vec<u8>,
+    pub key: QueryKey,
     kad: Addr<Kad<N>>,
     node_limit: usize,
     req_ttl: i64,
+    uid: usize,
     state: Rc<RefCell<QueryState<N>>>,
     future_state: Rc<RefCell<QueryFutureState>>,
 }
@@ -33,23 +34,23 @@ where
     <N as ArrayLength<u8>>::ArrayType: Unpin,
 {
     pub fn new(
-        key: Vec<u8>,
-        nodes: &Vec<Node<N>>,
+        key: QueryKey,
+        nodes: Vec<Node<N>>,
         kad: Addr<Kad<N>>,
         node_limit: usize,
         req_ttl: i64,
     ) -> Self {
         let mut query = Query {
-            uid: usize::max_value(),
             key,
             kad,
             node_limit,
             req_ttl,
+            uid: usize::max_value(),
             state: Rc::new(RefCell::new(QueryState::default())),
             future_state: Rc::new(RefCell::new(QueryFutureState::default())),
         };
 
-        query.feed(nodes.clone(), None);
+        query.feed(nodes, None);
         query
     }
 
@@ -77,7 +78,7 @@ where
 
             *candidates = std::mem::replace(candidates, Vec::new())
                 .into_iter()
-                .chain(nodes.clone().into_iter())
+                .chain(nodes.into_iter())
                 .filter(|n| !sent.contains(&n.key))
                 .unique()
                 .sorted_by_key(|n| n.distance(&self.key))
@@ -153,10 +154,17 @@ where
             for to in nodes.into_iter() {
                 log::trace!("Send out to: {} (distance: {})", to.key, to.distance(&key));
 
-                let message = KadMessage::from(message::FindNode {
-                    rand_val: rand.next_u32(),
-                    key: key.clone(),
-                });
+                let rand_val = rand.next_u32();
+                let message = match &key {
+                    QueryKey::Node(key) => KadMessage::from(message::FindNode {
+                        rand_val,
+                        key: key.clone(),
+                    }),
+                    QueryKey::Value(key) => KadMessage::from(message::FindValue {
+                        rand_val,
+                        key: key.clone(),
+                    }),
+                };
 
                 if let Err(e) = address.send(EvtSend { to, message }).await {
                     log::error!("Unable to send query message: {:?}", e);
@@ -257,7 +265,35 @@ impl Default for QueryFutureState {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) enum QueryKey {
+    Node(Vec<u8>),
+    Value(Vec<u8>),
+}
+
+impl QueryKey {
+    #[inline(always)]
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.inner().clone()
+    }
+
+    #[inline(always)]
+    fn inner(&self) -> &Vec<u8> {
+        match &self {
+            QueryKey::Node(v) | QueryKey::Value(v) => &v,
+        }
+    }
+}
+
+impl AsRef<[u8]> for QueryKey {
+    #[inline(always)]
+    fn as_ref(&self) -> &[u8] {
+        &self.inner()
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) enum QueryValue<N: KeyLen> {
     Node(Node<N>),
+    Value(Vec<u8>),
     None,
 }

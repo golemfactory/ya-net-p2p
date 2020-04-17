@@ -158,7 +158,7 @@ async fn find_node(nodes: &HashMap<Node, Addr<Kad>>) -> Result<Option<Node>, Err
         }
     }
 
-    log::info!("Initiating node query {} by {}", to_find.0, searcher.0);
+    log::info!("Initiating node query [{} by {}", to_find.0.key, searcher.0);
 
     searcher
         .1
