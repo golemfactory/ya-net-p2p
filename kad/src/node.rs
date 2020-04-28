@@ -39,7 +39,7 @@ impl<N: KeyLen> TryFrom<message::Node> for Node<N> {
                         SocketAddr::from((Ipv4Addr::from(ip), node.port as u16))
                     }
                     message::node::Ip::V6(v6) => {
-                        let mut ip = (v6.hi << 64) as u128;
+                        let mut ip = (v6.hi as u128) << 64;
                         ip |= v6.lo as u128;
                         SocketAddr::from((Ipv6Addr::from(ip), node.port as u16))
                     }
