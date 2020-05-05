@@ -107,20 +107,13 @@ where
 
     #[inline]
     fn request_upkeep(&mut self, _: &mut Context<Self>) {
-        let mut to_remove = HashSet::new();
         let ttl = self.conf.request_ttl;
         let now = Utc::now().timestamp();
+        let table = &mut self.table;
 
-        self.requests.retain(|_, (_, key, created_at)| {
-            if now - *created_at < ttl {
-                true
-            } else {
-                to_remove.insert(key.clone());
-                false
-            }
-        });
-
-        to_remove.iter().for_each(|k| self.table.remove(k));
+        self.requests
+            .drain_filter(|_, (_, _, created_at)| now - *created_at < ttl)
+            .for_each(|(_, (_, key, _))| table.remove(&key));
     }
 
     #[inline]
