@@ -1,5 +1,5 @@
 pub use key::{lengths as key_lengths, Key, KeyLen};
-pub use node::Node;
+pub use node::{Node, NodeData};
 pub use service::{Kad, KadConfig};
 pub use table::Table;
 
@@ -35,6 +35,8 @@ pub enum Error {
     MissingRequest(String),
     #[error("Invalid query: {0}")]
     InvalidQuery(String),
+    #[error("Invalid node data")]
+    InvalidNodeData,
 }
 
 impl Error {

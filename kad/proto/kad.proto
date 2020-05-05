@@ -2,18 +2,9 @@ syntax = "proto3";
 
 package KAD;
 
-message IpV6 {
-    uint64 hi = 1;
-    uint64 lo = 2;
-}
-
 message Node {
-    oneof ip {
-        uint32 v4 = 1;
-        IpV6 v6 = 2;
-    }
-    uint32 port = 3;
-    bytes key = 4;
+    bytes key = 1;
+    bytes data = 2;
 }
 
 message Ping {

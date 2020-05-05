@@ -8,8 +8,9 @@ use structopt::StructOpt;
 
 type Size = ya_net_kad::key_lengths::U32;
 type Key = ya_net_kad::Key<Size>;
-type Node = ya_net_kad::Node<Size>;
-type Table = ya_net_kad::Table<Size>;
+type Data = SocketAddr;
+type Node = ya_net_kad::Node<Size, Data>;
+type Table = ya_net_kad::Table<Size, Data>;
 
 lazy_static::lazy_static! {
     static ref K: usize = Size::to_usize();
@@ -51,7 +52,7 @@ fn gen_nodes(count: usize) -> HashSet<Node> {
 
     keys.into_iter()
         .zip(addresses.into_iter())
-        .map(|(key, address)| Node { key, address })
+        .map(|(key, address)| Node { key, data: address })
         .collect()
 }
 

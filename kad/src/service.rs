@@ -8,6 +8,7 @@ use futures::{Future, FutureExt, SinkExt};
 use generic_array::ArrayLength;
 use hashbrown::{HashMap, HashSet};
 use rand::RngCore;
+use serde::de::DeserializeOwned;
 use std::convert::TryFrom;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::SeqCst;
@@ -58,35 +59,37 @@ impl Default for KadConfig {
     }
 }
 
-pub struct Kad<N>
+pub struct Kad<N, D>
 where
     N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
+    D: NodeData + 'static,
 {
-    node: Node<N>,
+    node: Node<N, D>,
     conf: KadConfig,
-    table: Table<N>,
+    table: Table<N, D>,
     storage: HashMap<Vec<u8>, (message::Value, i64)>,
-    queries: HashMap<Vec<u8>, (Query<N>, i64)>,
+    queries: HashMap<Vec<u8>, (Query<N, D>, i64)>,
     requests: HashMap<u32, (KadMessage, Key<N>, i64)>,
-    ping_backlog: HashSet<Node<N>>,
-    event_sender: mpsc::Sender<KadEvtSend<N>>,
+    ping_backlog: HashSet<Node<N, D>>,
+    event_sender: mpsc::Sender<KadEvtSend<N, D>>,
     rand_val_seq: AtomicU32,
 }
 
-impl<N> Kad<N>
+impl<N, D> Kad<N, D>
 where
     N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
+    D: NodeData + 'static,
 {
-    pub fn new(node: Node<N>, event_sender: mpsc::Sender<KadEvtSend<N>>) -> Self {
+    pub fn new(node: Node<N, D>, event_sender: mpsc::Sender<KadEvtSend<N, D>>) -> Self {
         Self::with_conf(KadConfig::default(), node, event_sender)
     }
 
     pub fn with_conf(
         conf: KadConfig,
-        node: Node<N>,
-        event_sender: mpsc::Sender<KadEvtSend<N>>,
+        node: Node<N, D>,
+        event_sender: mpsc::Sender<KadEvtSend<N, D>>,
     ) -> Self {
         let key = node.key.clone();
         Self {
@@ -189,13 +192,14 @@ where
     }
 }
 
-impl<N> Kad<N>
+impl<N, D> Kad<N, D>
 where
     N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
+    D: NodeData + 'static,
 {
     #[inline]
-    fn send(&self, to: Node<N>, message: KadMessage) -> impl Future<Output = Result<()>> {
+    fn send(&self, to: Node<N, D>, message: KadMessage) -> impl Future<Output = Result<()>> {
         let from = self.node.clone();
         let mut event_sender = self.event_sender.clone();
 
@@ -207,7 +211,7 @@ where
         }
     }
 
-    fn find_node(&self, key: &Key<N>, excluded: Option<&Key<N>>) -> Vec<Node<N>> {
+    fn find_node(&self, key: &Key<N>, excluded: Option<&Key<N>>) -> Vec<Node<N, D>> {
         let mut nodes = self.table.neighbors(&key, excluded, None);
         if key == &self.node.key {
             if nodes.len() == self.table.bucket_size {
@@ -231,7 +235,7 @@ where
         None
     }
 
-    fn find_query(&mut self, rand_val: u32) -> Result<Query<N>> {
+    fn find_query(&mut self, rand_val: u32) -> Result<Query<N, D>> {
         let key = self
             .requests
             .remove(&rand_val)
@@ -248,9 +252,9 @@ where
     fn initiate_query(
         &mut self,
         query_key: QueryKey,
-        nodes: Vec<Node<N>>,
+        nodes: Vec<Node<N, D>>,
         address: Addr<Self>,
-    ) -> Query<N> {
+    ) -> Query<N, D> {
         let bucket_size = self.table.bucket_size;
         let request_ttl = self.conf.request_ttl;
 
@@ -267,10 +271,11 @@ where
     }
 }
 
-impl<N> Actor for Kad<N>
+impl<N, D> Actor for Kad<N, D>
 where
     N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
+    D: NodeData + 'static,
 {
     type Context = Context<Self>;
 
@@ -295,14 +300,15 @@ where
     }
 }
 
-impl<N> Handler<KadEvtBootstrap<N>> for Kad<N>
+impl<N, D> Handler<KadEvtBootstrap<N, D>> for Kad<N, D>
 where
     N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
+    D: NodeData + 'static,
 {
     type Result = ActorResponse<Self, (), Error>;
 
-    fn handle(&mut self, msg: KadEvtBootstrap<N>, ctx: &mut Context<Self>) -> Self::Result {
+    fn handle(&mut self, msg: KadEvtBootstrap<N, D>, ctx: &mut Context<Self>) -> Self::Result {
         log::debug!("{} bootstrapping", self.conf.name);
 
         self.table.extend(msg.nodes.iter());
@@ -331,14 +337,15 @@ where
     }
 }
 
-impl<N> Handler<KadEvtReceive<N>> for Kad<N>
+impl<N, D> Handler<KadEvtReceive<N, D>> for Kad<N, D>
 where
     N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
+    D: NodeData + DeserializeOwned + 'static,
 {
     type Result = ActorResponse<Self, (), Error>;
 
-    fn handle(&mut self, evt: KadEvtReceive<N>, ctx: &mut Context<Self>) -> Self::Result {
+    fn handle(&mut self, evt: KadEvtReceive<N, D>, ctx: &mut Context<Self>) -> Self::Result {
         log::trace!("{} rx {} from {}", self.conf.name, evt.message, evt.from);
 
         let address = ctx.address();
@@ -374,10 +381,11 @@ where
 
 type HandleMsgResult = Result<Option<KadMessage>>;
 
-impl<N> Kad<N>
+impl<N, D> Kad<N, D>
 where
     N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
+    D: NodeData + DeserializeOwned + 'static,
 {
     #[inline]
     fn handle_ping(&mut self, msg: message::Ping) -> impl Future<Output = HandleMsgResult> {
@@ -577,14 +585,15 @@ where
     }
 }
 
-impl<N> Handler<KadEvtFindNode<N>> for Kad<N>
+impl<N, D> Handler<KadEvtFindNode<N, D>> for Kad<N, D>
 where
     N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
+    D: NodeData + 'static,
 {
-    type Result = ActorResponse<Self, Option<Node<N>>, Error>;
+    type Result = ActorResponse<Self, Option<Node<N, D>>, Error>;
 
-    fn handle(&mut self, msg: KadEvtFindNode<N>, ctx: &mut Context<Self>) -> Self::Result {
+    fn handle(&mut self, msg: KadEvtFindNode<N, D>, ctx: &mut Context<Self>) -> Self::Result {
         log::debug!("{} find node request: {}", self.conf.name, msg.key);
 
         if self.node.key == msg.key {
@@ -609,10 +618,11 @@ where
     }
 }
 
-impl<N> Handler<KadEvtFindValue> for Kad<N>
+impl<N, D> Handler<KadEvtFindValue> for Kad<N, D>
 where
     N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
+    D: NodeData + 'static,
 {
     type Result = ActorResponse<Self, Option<(Vec<u8>, Vec<u8>)>, Error>;
 
@@ -646,14 +656,15 @@ where
     }
 }
 
-impl<N> Handler<EvtRequest<N>> for Kad<N>
+impl<N, D> Handler<EvtRequest<N, D>> for Kad<N, D>
 where
     N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
+    D: NodeData + 'static,
 {
     type Result = ActorResponse<Self, (), Error>;
 
-    fn handle(&mut self, mut evt: EvtRequest<N>, _: &mut Context<Self>) -> Self::Result {
+    fn handle(&mut self, mut evt: EvtRequest<N, D>, _: &mut Context<Self>) -> Self::Result {
         // Transform port for non-UDP & fixed-port operating mode?
         log::trace!("{} tx {} to {}", self.conf.name, evt.message, evt.to);
 
@@ -673,36 +684,38 @@ where
     }
 }
 
-impl<N> Handler<EvtRespond<N>> for Kad<N>
+impl<N, D> Handler<EvtRespond<N, D>> for Kad<N, D>
 where
     N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
+    D: NodeData + 'static,
 {
     type Result = ActorResponse<Self, (), Error>;
 
-    fn handle(&mut self, evt: EvtRespond<N>, _: &mut Context<Self>) -> Self::Result {
+    fn handle(&mut self, evt: EvtRespond<N, D>, _: &mut Context<Self>) -> Self::Result {
         log::trace!("{} tx {} to {}", self.conf.name, evt.message, evt.to);
 
         ActorResponse::r#async(self.send(evt.to, evt.message).into_actor(self))
     }
 }
 
-impl<N> Handler<EvtAddressChanged> for Kad<N>
+impl<N, D> Handler<EvtNodeDataChanged<D>> for Kad<N, D>
 where
     N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
+    D: NodeData + 'static,
 {
-    type Result = <EvtAddressChanged as Message>::Result;
+    type Result = <EvtNodeDataChanged<D> as Message>::Result;
 
-    fn handle(&mut self, evt: EvtAddressChanged, _: &mut Context<Self>) -> Self::Result {
+    fn handle(&mut self, evt: EvtNodeDataChanged<D>, _: &mut Context<Self>) -> Self::Result {
         log::debug!(
             "{} address changed from {:?} to {:?}",
             self.conf.name,
-            self.node.address,
-            evt.address
+            self.node.data,
+            evt.data
         );
 
-        std::mem::replace(&mut self.node.address, evt.address);
+        std::mem::replace(&mut self.node.data, evt.data);
         Ok(())
     }
 }

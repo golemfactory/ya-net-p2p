@@ -1,29 +1,41 @@
+use crate::node::NodeData;
 use crate::{message, Key, KeyLen, Node, Result};
 use actix::Message;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::marker::PhantomData;
 
 #[derive(Clone, Debug, Message, Deserialize, Serialize)]
 #[rtype(result = "()")]
-pub struct KadEvtSend<N: KeyLen> {
-    pub from: Node<N>,
-    pub to: Node<N>,
+pub struct KadEvtSend<N: KeyLen, D: NodeData> {
+    pub from: Node<N, D>,
+    pub to: Node<N, D>,
     pub message: KadMessage,
 }
 
 #[derive(Clone, Debug, Message, Deserialize, Serialize)]
 #[rtype(result = "Result<()>")]
-pub struct KadEvtReceive<N: KeyLen> {
-    pub from: Node<N>,
+pub struct KadEvtReceive<N: KeyLen, D: NodeData> {
+    pub from: Node<N, D>,
     pub new: bool,
     pub message: KadMessage,
 }
 
 #[derive(Clone, Debug, Message, Deserialize, Serialize)]
-#[rtype(result = "Result<Option<Node<N>>>")]
-pub struct KadEvtFindNode<N: KeyLen + 'static> {
+#[rtype(result = "Result<Option<Node<N, D>>>")]
+pub struct KadEvtFindNode<N: KeyLen + 'static, D: NodeData + 'static> {
     pub key: Key<N>,
     pub timeout: f64,
+    phantom: PhantomData<D>,
+}
+
+impl<N: KeyLen + 'static, D: NodeData + 'static> KadEvtFindNode<N, D> {
+    pub fn new(key: Key<N>, timeout: f64) -> Self {
+        KadEvtFindNode {
+            key,
+            timeout,
+            phantom: PhantomData,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Message, Deserialize, Serialize)]
@@ -34,29 +46,29 @@ pub struct KadEvtFindValue {
 
 #[derive(Clone, Debug, Message, Deserialize, Serialize)]
 #[rtype(result = "Result<()>")]
-pub struct KadEvtBootstrap<N: KeyLen> {
-    pub nodes: Vec<Node<N>>,
+pub struct KadEvtBootstrap<N: KeyLen, D: NodeData> {
+    pub nodes: Vec<Node<N, D>>,
     pub dormant: bool,
 }
 
 #[derive(Clone, Debug, Message)]
 #[rtype(result = "Result<()>")]
-pub(crate) struct EvtRespond<N: KeyLen> {
-    pub to: Node<N>,
+pub(crate) struct EvtRequest<N: KeyLen, D: NodeData> {
+    pub to: Node<N, D>,
     pub message: KadMessage,
 }
 
 #[derive(Clone, Debug, Message)]
 #[rtype(result = "Result<()>")]
-pub(crate) struct EvtRequest<N: KeyLen> {
-    pub to: Node<N>,
+pub(crate) struct EvtRespond<N: KeyLen, D: NodeData> {
+    pub to: Node<N, D>,
     pub message: KadMessage,
 }
 
 #[derive(Clone, Debug, Message)]
 #[rtype(result = "Result<()>")]
-pub(crate) struct EvtAddressChanged {
-    pub address: SocketAddr,
+pub(crate) struct EvtNodeDataChanged<D: NodeData> {
+    pub data: D,
 }
 
 macro_rules! kad_message {

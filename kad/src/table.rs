@@ -1,18 +1,19 @@
-use crate::{Key, KeyLen, Node};
+use crate::key::{Key, KeyLen};
+use crate::node::{Node, NodeData};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 const BUCKET_REFRESH_INTERVAL: i64 = 3600;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Table<N: KeyLen> {
+pub struct Table<N: KeyLen, D: NodeData> {
     pub key: Key<N>,
-    buckets: Vec<Bucket<N>>,
+    buckets: Vec<Bucket<N, D>>,
     pub table_size: usize,
     pub bucket_size: usize,
 }
 
-impl<N: KeyLen + 'static> Table<N> {
+impl<N: KeyLen + 'static, D: NodeData + 'static> Table<N, D> {
     pub fn new(key: Key<N>) -> Self {
         Self::with_size(key, N::to_usize() * 8, N::to_usize())
     }
@@ -27,7 +28,7 @@ impl<N: KeyLen + 'static> Table<N> {
         }
     }
 
-    pub fn add(&mut self, node: &Node<N>) -> bool {
+    pub fn add(&mut self, node: &Node<N, D>) -> bool {
         let idx = self.bucket_index(&node.key);
         let len = self.buckets.len();
         let bucket = &mut self.buckets[idx];
@@ -58,7 +59,7 @@ impl<N: KeyLen + 'static> Table<N> {
     }
 
     #[inline]
-    pub fn extend<'l, I: Iterator<Item = &'l Node<N>>>(&mut self, iter: I) {
+    pub fn extend<'l, I: Iterator<Item = &'l Node<N, D>>>(&mut self, iter: I) {
         iter.for_each(|n| {
             self.add(&n);
         });
@@ -71,12 +72,12 @@ impl<N: KeyLen + 'static> Table<N> {
     }
 
     #[inline]
-    pub fn contains(&self, node: &Node<N>) -> bool {
+    pub fn contains(&self, node: &Node<N, D>) -> bool {
         self.buckets[self.bucket_index(&node.key)].contains(node)
     }
 
     #[inline]
-    pub fn get(&self, key: &Key<N>) -> Option<&Node<N>> {
+    pub fn get(&self, key: &Key<N>) -> Option<&Node<N, D>> {
         self.buckets[self.bucket_index(&key)].get(key)
     }
 
@@ -85,7 +86,7 @@ impl<N: KeyLen + 'static> Table<N> {
         key: &Key<N>,
         excluded: Option<&Key<N>>,
         max: Option<usize>,
-    ) -> Vec<Node<N>> {
+    ) -> Vec<Node<N, D>> {
         let max = max.unwrap_or(self.bucket_size);
         let mut result = Vec::new();
 
@@ -124,7 +125,7 @@ impl<N: KeyLen + 'static> Table<N> {
     }
 
     #[inline]
-    pub fn distant_nodes(&self, key: &Key<N>) -> Vec<Node<N>> {
+    pub fn distant_nodes(&self, key: &Key<N>) -> Vec<Node<N, D>> {
         let idx = self.bucket_index(key);
         if idx == self.buckets.len() - 1 {
             Vec::new()
@@ -137,7 +138,7 @@ impl<N: KeyLen + 'static> Table<N> {
     }
 
     #[inline]
-    pub fn bucket_oldest(&self, key: &Key<N>) -> Option<Node<N>> {
+    pub fn bucket_oldest(&self, key: &Key<N>) -> Option<Node<N, D>> {
         let idx = self.bucket_index(key);
         self.buckets[idx].oldest().cloned()
     }
@@ -210,19 +211,19 @@ impl Iterator for AlternatingIter {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Bucket<N: KeyLen> {
+pub struct Bucket<N: KeyLen, D: NodeData> {
     updated: DateTime<Utc>,
-    nodes: Vec<Node<N>>,
-    queue: Vec<Node<N>>,
+    nodes: Vec<Node<N, D>>,
+    queue: Vec<Node<N, D>>,
     size: usize,
 }
 
-impl<N: KeyLen> Bucket<N> {
+impl<N: KeyLen, D: NodeData> Bucket<N, D> {
     fn new(size: usize) -> Self {
         Self::with_nodes(Vec::with_capacity(size), size)
     }
 
-    fn with_nodes(nodes: Vec<Node<N>>, size: usize) -> Self {
+    fn with_nodes(nodes: Vec<Node<N, D>>, size: usize) -> Self {
         Bucket {
             updated: Utc::now(),
             nodes,
@@ -232,12 +233,12 @@ impl<N: KeyLen> Bucket<N> {
     }
 
     #[inline(always)]
-    pub fn oldest(&self) -> Option<&Node<N>> {
+    pub fn oldest(&self) -> Option<&Node<N, D>> {
         self.nodes.get(0)
     }
 
     #[inline(always)]
-    pub fn furthest(&self, key: &Key<N>) -> Option<&Node<N>> {
+    pub fn furthest(&self, key: &Key<N>) -> Option<&Node<N, D>> {
         self.nodes.iter().max_by_key(|n| n.distance(key))
     }
 
@@ -247,18 +248,18 @@ impl<N: KeyLen> Bucket<N> {
     }
 
     #[inline(always)]
-    fn contains(&self, node: &Node<N>) -> bool {
+    fn contains(&self, node: &Node<N, D>) -> bool {
         self.nodes.contains(node)
     }
 
-    fn get(&self, key: &Key<N>) -> Option<&Node<N>> {
+    fn get(&self, key: &Key<N>) -> Option<&Node<N, D>> {
         match self.nodes.iter().position(|node| &node.key == key) {
             Some(idx) => Some(&self.nodes[idx]),
             None => None,
         }
     }
 
-    fn add(&mut self, node: &Node<N>) -> bool {
+    fn add(&mut self, node: &Node<N, D>) -> bool {
         self.updated = Utc::now();
 
         self.remove(&node.key);
@@ -279,7 +280,7 @@ impl<N: KeyLen> Bucket<N> {
         }
     }
 
-    fn split(&mut self, key: &Key<N>, idx: usize) -> Bucket<N> {
+    fn split(&mut self, key: &Key<N>, idx: usize) -> Bucket<N, D> {
         let nodes = std::mem::replace(&mut self.nodes, Vec::new());
         let (retain, split) = nodes
             .into_iter()
@@ -289,8 +290,8 @@ impl<N: KeyLen> Bucket<N> {
     }
 }
 
-impl<N: KeyLen> AsRef<[Node<N>]> for Bucket<N> {
-    fn as_ref(&self) -> &[Node<N>] {
+impl<N: KeyLen, D: NodeData> AsRef<[Node<N, D>]> for Bucket<N, D> {
+    fn as_ref(&self) -> &[Node<N, D>] {
         &self.nodes
     }
 }

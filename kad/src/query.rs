@@ -1,6 +1,6 @@
 use crate::event::{EvtRequest, KadMessage};
 use crate::message;
-use crate::{Kad, Key, KeyLen, Node, ALPHA};
+use crate::{Kad, Key, KeyLen, Node, NodeData, ALPHA};
 use actix::prelude::*;
 use chrono::Utc;
 use futures::task::{Poll, Waker};
@@ -13,29 +13,31 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::SeqCst;
 
-pub(crate) struct Query<N>
+pub(crate) struct Query<N, D>
 where
     N: KeyLen + Unpin + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
+    D: NodeData + 'static,
 {
     pub key: QueryKey,
-    kad: Addr<Kad<N>>,
+    kad: Addr<Kad<N, D>>,
     node_limit: usize,
     req_ttl: i64,
     uid: usize,
-    state: Rc<RefCell<QueryState<N>>>,
+    state: Rc<RefCell<QueryState<N, D>>>,
     future_state: Rc<RefCell<QueryFutureState>>,
 }
 
-impl<N> Query<N>
+impl<N, D> Query<N, D>
 where
     N: KeyLen + Unpin + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
+    D: NodeData + 'static,
 {
     pub fn new(
         key: QueryKey,
-        nodes: Vec<Node<N>>,
-        kad: Addr<Kad<N>>,
+        nodes: Vec<Node<N, D>>,
+        kad: Addr<Kad<N, D>>,
         node_limit: usize,
         req_ttl: i64,
     ) -> Self {
@@ -61,7 +63,7 @@ where
         false
     }
 
-    pub fn feed(&mut self, nodes: Vec<Node<N>>, from: Option<&Key<N>>) {
+    pub fn feed(&mut self, nodes: Vec<Node<N, D>>, from: Option<&Key<N>>) {
         let mut iterate = false;
 
         if let QueryState::InProgress {
@@ -126,7 +128,7 @@ where
         }
     }
 
-    pub fn finish(&mut self, result: QueryValue<N>) {
+    pub fn finish(&mut self, result: QueryValue<N, D>) {
         if self.in_progress() {
             self.state.replace(QueryState::Finished { result });
             self.future_state
@@ -137,7 +139,7 @@ where
         }
     }
 
-    fn send_out(&mut self, nodes: Vec<Node<N>>) {
+    fn send_out(&mut self, nodes: Vec<Node<N, D>>) {
         let address = self.kad.clone();
         let key = self.key.clone();
 
@@ -170,10 +172,11 @@ where
     }
 }
 
-impl<N> Clone for Query<N>
+impl<N, D> Clone for Query<N, D>
 where
     N: KeyLen + Unpin + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
+    D: NodeData + 'static,
 {
     fn clone(&self) -> Self {
         let state = self.future_state.borrow_mut();
@@ -191,10 +194,11 @@ where
     }
 }
 
-impl<N> Drop for Query<N>
+impl<N, D> Drop for Query<N, D>
 where
     N: KeyLen + Unpin + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
+    D: NodeData + 'static,
 {
     fn drop(&mut self) {
         let mut fut_state = self.future_state.borrow_mut();
@@ -202,12 +206,13 @@ where
     }
 }
 
-impl<N> Future for Query<N>
+impl<N, D> Future for Query<N, D>
 where
     N: KeyLen + Unpin + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
+    D: NodeData + 'static,
 {
-    type Output = QueryValue<N>;
+    type Output = QueryValue<N, D>;
 
     #[inline]
     fn poll(self: Pin<&mut Self>, cx: &mut futures::task::Context<'_>) -> Poll<Self::Output> {
@@ -222,19 +227,19 @@ where
 }
 
 #[derive(Debug)]
-pub(crate) enum QueryState<N: KeyLen> {
+pub(crate) enum QueryState<N: KeyLen, D: NodeData> {
     InProgress {
         started_at: i64,
         pending: HashSet<Key<N>>,
-        candidates: Vec<Node<N>>,
+        candidates: Vec<Node<N, D>>,
         sent: HashSet<Key<N>>,
     },
     Finished {
-        result: QueryValue<N>,
+        result: QueryValue<N, D>,
     },
 }
 
-impl<N: KeyLen> Default for QueryState<N> {
+impl<N: KeyLen, D: NodeData> Default for QueryState<N, D> {
     fn default() -> Self {
         QueryState::InProgress {
             started_at: Utc::now().timestamp(),
@@ -288,8 +293,8 @@ impl AsRef<[u8]> for QueryKey {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum QueryValue<N: KeyLen> {
-    Node(Node<N>),
+pub(crate) enum QueryValue<N: KeyLen, D: NodeData> {
+    Node(Node<N, D>),
     Value(Vec<u8>),
     None,
 }

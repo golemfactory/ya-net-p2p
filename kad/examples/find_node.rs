@@ -11,8 +11,9 @@ use ya_net_kad::{event::*, Error, KadConfig};
 
 type Size = ya_net_kad::key_lengths::U32;
 type Key = ya_net_kad::Key<Size>;
-type Node = ya_net_kad::Node<Size>;
-type Kad = ya_net_kad::Kad<Size>;
+type Data = SocketAddr;
+type Node = ya_net_kad::Node<Size, Data>;
+type Kad = ya_net_kad::Kad<Size, Data>;
 
 const MULTIPLIER: usize = 16;
 
@@ -52,7 +53,7 @@ fn gen_nodes(count: usize) -> HashSet<Node> {
 
     keys.into_iter()
         .zip(addresses.into_iter())
-        .map(|(key, address)| Node { key, address })
+        .map(|(key, address)| Node { key, data: address })
         .collect()
 }
 
@@ -61,7 +62,7 @@ fn spawn_nodes(
 ) -> (
     HashMap<Node, Addr<Kad>>,
     HashMap<Node, Addr<Kad>>,
-    mpsc::Receiver<KadEvtSend<Size>>,
+    mpsc::Receiver<KadEvtSend<Size, Data>>,
 ) {
     let (tx, rx) = mpsc::channel(size * MULTIPLIER);
     let mut nodes = gen_nodes(size + (size + 99) / 100 + 1)
@@ -162,17 +163,14 @@ async fn find_node(nodes: &HashMap<Node, Addr<Kad>>) -> Result<Option<Node>, Err
 
     searcher
         .1
-        .send(KadEvtFindNode {
-            key: to_find.0.key.clone(),
-            timeout: 0f64,
-        })
+        .send(KadEvtFindNode::new(to_find.0.key.clone(), 0f64))
         .await?
 }
 
 async fn route(
     concurrency_limit: usize,
     nodes: HashMap<Node, Addr<Kad>>,
-    rx: mpsc::Receiver<KadEvtSend<Size>>,
+    rx: mpsc::Receiver<KadEvtSend<Size, Data>>,
 ) {
     let nodes_ref = &nodes;
     rx.for_each_concurrent(concurrency_limit, |m| async move {
