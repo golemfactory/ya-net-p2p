@@ -5,29 +5,46 @@ authors = ["Golem Factory <contact@golem.network>"]
 edition = "2018"
 
 [features]
-service=[]
+default = ["yagna"]
+mk1=["yagna"]
+yagna = ["ya-core-model", "ya-service-api", "ya-service-api-interfaces", "ya-service-bus"]
 
 [dependencies]
-ya-core-model = { version = "0.1", features=["ethaddr", "net"] }
-ya-service-api = "0.1"
-ya-service-api-interfaces = "0.1"
-ya-service-bus = "0.2"
+ya-net-kad = "0.1"
 
+ya-core-model = { version = "0.1", features = ["ethaddr", "net", "identity"], optional = true }
+ya-service-api = { version = "0.1", optional = true }
+ya-service-api-interfaces = { version = "0.1", optional = true }
+ya-service-bus = { version = "0.2", optional = true }
+
+actix = "0.9"
 anyhow = "1.0"
+ethsign = "0.7.3"
+crossbeam-channel = "0.3.9"
+futures = "0.3"
+generic-array = "0.13.2"
+hashbrown = "0.7"
+lazy_static = "1.4.0"
 log = "0.4"
+rmp-serde = {version = "=0.14.3" }
+serde = "1.0"
+sha2 = "0.8.1"
 thiserror = "1.0"
+tokio = { version = "0.2.18", features = ["time"] }
+tokio-bytes = { version = "0.5", package = "bytes" }
 
-[dependencies.futures]
-package = "futures"
-version = "0.3"
+[dependencies.laminar]
+git = "https://github.com/mfranciszkiewicz/laminar"
+branch = "feature/ack-frags"
 
 [[example]]
 name="test_net_mk1"
-required-features = ["service"]
+required-features = ["mk1"]
 
 [dev-dependencies]
 actix-rt = "1.0"
 env_logger = "0.7"
+itertools = "0.9.0"
+rand = "0.7.3"
 structopt = "0.3"
-serde = "1.0"
 ya-sb-router = "0.1"
