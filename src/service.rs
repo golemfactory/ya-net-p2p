@@ -50,7 +50,7 @@ where
     session_protocol: Option<Recipient<SessionCmd<Key>>>,
     dht_protocol: Option<Recipient<DhtCmd<Key>>>,
 
-    pending_connections: HashMap<Address, (Instant, TriggerFut<Address>)>,
+    pending_connections: HashMap<Address, (Instant, TriggerFut<Result<Address>>)>,
     connections: HashMap<Address, Connection<Key>>,
     sessions: HashMap<Key, Session<Key>>,
 }
@@ -125,13 +125,13 @@ where
         self.pending_connections
             .drain_filter(|_, (time, _)| duration < now - *time)
             .for_each(|(addr, (_, mut trigger))| {
-                if trigger.pending() {
+                if trigger.is_pending() {
                     log::debug!(
                         "Connection to {:?} timed out after {}s",
                         addr,
                         duration.as_secs()
                     );
-                    trigger.failure()
+                    trigger.ready(Err(Error::from(NetworkError::Timeout)))
                 }
             });
     }
@@ -423,14 +423,14 @@ where
 
                 if let Some((_, mut pending)) = self.pending_connections.remove(&address) {
                     log::debug!("Connected to {:?} (outbound)", address);
-                    pending.success();
+                    pending.ready(Ok(address));
                 } else {
                     log::debug!("Connected to {:?} (inbound)", address);
                 }
             }
             TransportEvt::Disconnected(address, reason) => {
-                if let Some((_, mut pending)) = self.pending_connections.remove(&address) {
-                    pending.failure();
+                if let Some((_, mut trigger)) = self.pending_connections.remove(&address) {
+                    trigger.ready(Err(Error::from(NetworkError::NoConnection)));
                 }
 
                 if let Some(conn) = self.connections.remove(&address) {
@@ -552,16 +552,16 @@ where
                 let is_pending = self.pending_connections.contains_key(&address);
                 let is_connected = self.connections.contains_key(&address);
 
-                let pending = &mut self
+                let trigger = &mut self
                     .pending_connections
                     .entry(address)
-                    .or_insert_with(|| (Instant::now(), TriggerFut::new(address)))
+                    .or_insert_with(|| (Instant::now(), TriggerFut::new()))
                     .1;
 
                 match (is_connected, is_pending) {
                     (true, _) => {
                         log::debug!("Connection to {:?} already established", address);
-                        pending.success()
+                        trigger.ready(Ok(address));
                     }
                     (_, false) => {
                         log::debug!("Connecting to {:?}", address);
@@ -570,7 +570,7 @@ where
                     _ => {}
                 }
 
-                triggers.push(pending.clone());
+                triggers.push(trigger.clone());
             };
         });
 
@@ -699,7 +699,7 @@ mod internal {
     pub struct Shutdown;
 
     #[derive(Clone, Debug, Message)]
-    #[rtype(result = "Result<Vec<TriggerFut<Address>>>")]
+    #[rtype(result = "Result<Vec<TriggerFut<Result<Address>>>>")]
     pub struct Connect(pub Vec<Address>);
 
     #[derive(Clone, Debug, Message)]

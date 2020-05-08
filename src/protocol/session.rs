@@ -86,8 +86,8 @@ where
             SessionCmd::Initiate(address) => {
                 let packet = Packet {
                     payload: Payload::builder(Self::PROTOCOL_ID)
-                        .with_signature()
                         .with_auth()
+                        .with_signature()
                         .build(),
                     guarantees: Guarantees::ordered_default(),
                 };

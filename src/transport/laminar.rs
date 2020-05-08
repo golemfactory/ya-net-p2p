@@ -102,13 +102,13 @@ where
         socket_addr: SocketAddr,
         packet: EncodedPacket,
     ) -> impl Future<Output = Result<()>> {
-        let mut sender = match &self.message_sender {
-            Some(sender) => sender.clone(),
+        let mut channel = match &self.message_sender {
+            Some(channel) => channel.clone(),
             None => return futures::future::err(ChannelError::Closed.into()).left_future(),
         };
 
         return async move {
-            sender
+            channel
                 .send(packet.addressed_with(Address::LAMINAR, socket_addr))
                 .await?;
             Ok(())
