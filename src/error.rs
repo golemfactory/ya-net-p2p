@@ -1,7 +1,7 @@
 use crate::protocol::ProtocolId;
 use crate::transport::{Address, TransportId};
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Clone, Debug)]
 pub enum NetworkError {
     #[error("no address provided")]
     NoAddress,
@@ -21,9 +21,11 @@ pub enum NetworkError {
     Protocol(String),
     #[error("transport error: {0}")]
     Transport(String),
+    #[error("timeout")]
+    Timeout,
 }
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Clone, Debug)]
 pub enum SessionError {
     #[error("key mismatch: expected {0:?}, received {1:?}")]
     KeyMismatch(Vec<u8>, Vec<u8>),
@@ -35,13 +37,13 @@ pub enum SessionError {
     Timeout,
 }
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Clone, Debug)]
 pub enum DiscoveryError {
     #[error("timeout: {0}")]
     Timeout(String),
 }
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Clone, Debug)]
 pub enum ProtocolError {
     #[error("invalid protocol id: {0}")]
     InvalidId(String),
@@ -49,7 +51,7 @@ pub enum ProtocolError {
     InvalidState(String),
 }
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Clone, Debug)]
 pub enum MessageError {
     #[error("codec error: {0}")]
     Codec(String),
@@ -61,7 +63,7 @@ pub enum MessageError {
     MissingSignature,
 }
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Clone, Debug)]
 pub enum ChannelError {
     #[error("timeout")]
     Timeout,
@@ -71,13 +73,13 @@ pub enum ChannelError {
     Closed,
 }
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Clone, Debug)]
 pub enum CryptoError {
     #[error("invalid key")]
     InvalidKey,
 }
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Clone, Debug)]
 pub enum Error {
     #[error("message error: {0}")]
     Message(#[from] MessageError),
@@ -90,8 +92,6 @@ pub enum Error {
     #[error("discovery error: {0}")]
     Discovery(#[from] DiscoveryError),
 
-    #[error("service bus error: {0}")]
-    ServiceBus(#[from] ya_service_bus::Error),
     #[error("channel error: {0}")]
     Channel(#[from] ChannelError),
 
@@ -100,7 +100,11 @@ pub enum Error {
     #[error("identity error: {0}")]
     Identity(#[from] ya_core_model::identity::Error),
     #[error("signature error: {0}")]
-    Signature(#[from] ethsign::Error),
+    Signature(String),
+
+    #[cfg(feature = "yagna")]
+    #[error("service bus error: {0}")]
+    ServiceBus(String),
 
     #[error()]
     #[cfg(feature = "mk1")]
@@ -127,6 +131,20 @@ impl Error {
 
     pub fn key_mismatch<A: AsRef<[u8]>, B: AsRef<[u8]>>(a: A, b: B) -> Self {
         SessionError::KeyMismatch(a.as_ref().to_vec(), b.as_ref().to_vec()).into()
+    }
+}
+
+#[cfg(feature = "yagna")]
+impl From<ya_service_bus::Error> for Error {
+    fn from(err: ya_service_bus::Error) -> Self {
+        Error::ServiceBus(err.to_string())
+    }
+}
+
+#[cfg(feature = "yagna")]
+impl From<ethsign::Error> for Error {
+    fn from(err: ethsign::Error) -> Self {
+        Error::Signature(err.to_string())
     }
 }
 
