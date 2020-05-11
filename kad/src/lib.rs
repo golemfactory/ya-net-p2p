@@ -7,6 +7,7 @@ pub mod event;
 mod key;
 mod node;
 mod query;
+mod serialize;
 mod service;
 mod table;
 
@@ -37,6 +38,8 @@ pub enum Error {
     InvalidQuery(String),
     #[error("Invalid node data")]
     InvalidNodeData,
+    #[error("Serialization error: {0}")]
+    SerializationError(String),
 }
 
 impl Error {
