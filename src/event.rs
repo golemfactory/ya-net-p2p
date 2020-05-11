@@ -1,4 +1,4 @@
-use crate::packet::{AddressedPacket, EncodedPacket, Packet};
+use crate::packet::{AddressedPacket, Packet, WirePacket};
 use crate::transport::Address;
 use crate::{ProtocolId, Result, TransportId};
 use actix::prelude::*;
@@ -18,8 +18,8 @@ where
     RemoveTransport(TransportId),
     AddProtocol(ProtocolId, Recipient<ProtocolCmd<Key>>),
     RemoveProtocol(ProtocolId),
-    AddMangler(Recipient<MangleCmd<Key>>),
-    RemoveMangler(Recipient<MangleCmd<Key>>),
+    AddProcessor(Recipient<ProcessCmd<Key>>),
+    RemoveProcessor(Recipient<ProcessCmd<Key>>),
     Shutdown,
 }
 
@@ -57,7 +57,7 @@ pub enum TransportCmd {
     Shutdown,
     Connect(SocketAddr),
     Disconnect(SocketAddr),
-    Packet(SocketAddr, EncodedPacket),
+    Packet(SocketAddr, WirePacket),
 }
 
 unsafe impl Send for TransportCmd {}
@@ -101,30 +101,30 @@ unsafe impl<Key> Send for DhtCmd<Key> where Key: Send + Debug + Clone {}
 
 #[derive(Clone, Debug, Message)]
 #[rtype(result = "Result<Packet>")]
-pub enum MangleCmd<Key>
+pub enum ProcessCmd<Key>
 where
     Key: Send + Debug + Clone,
 {
-    Mangle {
+    Outbound {
         from: Option<Key>,
         to: Option<Key>,
         packet: Packet,
     },
-    Unmangle {
+    Inbound {
         from: Option<Key>,
         to: Option<Key>,
         packet: Packet,
     },
 }
 
-unsafe impl<Key> Send for MangleCmd<Key> where Key: Send + Debug + Clone {}
+unsafe impl<Key> Send for ProcessCmd<Key> where Key: Send + Debug + Clone {}
 
 #[derive(Clone, Debug, Message)]
 #[rtype(result = "()")]
 pub enum TransportEvt {
     Connected(Address, Sender<AddressedPacket>),
     Disconnected(Address, DisconnectReason),
-    Packet(Address, EncodedPacket),
+    Packet(Address, WirePacket),
 }
 
 unsafe impl Send for TransportEvt {}

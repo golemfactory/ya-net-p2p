@@ -1,5 +1,5 @@
 use crate::error::{Error, MessageError};
-use crate::packet::codec::BytesCodec;
+use crate::packet::codec::Codec;
 use crate::protocol::ProtocolId;
 use crate::Result;
 use std::mem::size_of;
@@ -14,33 +14,27 @@ pub struct PilotHeader {
 
 impl PilotHeader {
     pub const FLAG_RELAY: u8 = 0b_1000_0000;
-    pub const FLAG_AUTH: u8 = 0b_0000_0001;
-    pub const FLAG_SIGNATURE: u8 = 0b_0000_0010;
-    pub const FLAG_ENCRYPTION: u8 = 0b_0000_0100;
+    pub const FLAG_SIGNATURE: u8 = 0b_0000_0001;
+    pub const FLAG_ENCRYPTION: u8 = 0b_0000_0010;
 
     #[inline]
-    pub fn relay(&self) -> bool {
+    pub fn is_relayed(&self) -> bool {
         self.header_flags & Self::FLAG_RELAY == Self::FLAG_RELAY
     }
 
     #[inline]
-    pub fn auth(&self) -> bool {
-        self.header_flags & Self::FLAG_AUTH == Self::FLAG_AUTH
-    }
-
-    #[inline]
-    pub fn signature(&self) -> bool {
+    pub fn is_signed(&self) -> bool {
         self.header_flags & Self::FLAG_SIGNATURE == Self::FLAG_SIGNATURE
     }
 
     #[inline]
-    pub fn encryption(&self) -> bool {
+    pub fn is_encrypted(&self) -> bool {
         self.header_flags & Self::FLAG_ENCRYPTION == Self::FLAG_ENCRYPTION
     }
 }
 
-impl BytesCodec for PilotHeader {
-    fn encode(&self, bytes: &mut BytesMut) {
+impl Codec for PilotHeader {
+    fn encode(&mut self, bytes: &mut BytesMut) {
         bytes.put_uint(self.protocol_id as u64, size_of::<ProtocolId>());
         bytes.put_u8(self.header_flags);
         bytes.put_u16(self.payload_offset);
@@ -63,20 +57,25 @@ impl BytesCodec for PilotHeader {
     }
 }
 
+impl From<ProtocolId> for PilotHeader {
+    fn from(protocol_id: u16) -> Self {
+        PilotHeader {
+            protocol_id,
+            payload_offset: 0,
+            header_flags: 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BytesHeader {
+pub struct BytesPayload {
     vec: Vec<u8>,
 }
 
-impl BytesHeader {
+impl BytesPayload {
     #[inline]
-    pub fn ser_overhead() -> usize {
-        size_of::<u16>()
-    }
-
-    #[inline]
-    pub fn ser_size(&self) -> usize {
-        Self::ser_overhead() + self.vec.len()
+    pub fn size(&self) -> usize {
+        size_of::<u16>() + self.vec.len()
     }
 
     #[inline]
@@ -85,18 +84,30 @@ impl BytesHeader {
     }
 }
 
-impl From<Vec<u8>> for BytesHeader {
-    fn from(mut vec: Vec<u8>) -> Self {
-        let len = vec.len() as u16;
-        vec.truncate(len as usize);
-        BytesHeader { vec }
+impl BytesPayload {
+    #[inline]
+    pub fn encode_with_vec(vec: &Vec<u8>, bytes: &mut BytesMut) {
+        bytes.put_u16(vec.len() as u16);
+        bytes.put(vec.as_ref());
+    }
+
+    #[inline]
+    pub fn decode_to_vec(bytes: &mut Bytes) -> Result<Vec<u8>> {
+        Self::decode(bytes).map(|b| b.vec)
     }
 }
 
-impl BytesCodec for BytesHeader {
-    fn encode(&self, bytes: &mut BytesMut) {
-        bytes.put_u16(self.vec.len() as u16);
-        bytes.put(self.vec.as_ref());
+impl From<Vec<u8>> for BytesPayload {
+    fn from(mut vec: Vec<u8>) -> Self {
+        let len = vec.len() as u16;
+        vec.truncate(len as usize);
+        BytesPayload { vec }
+    }
+}
+
+impl Codec for BytesPayload {
+    fn encode(&mut self, bytes: &mut BytesMut) {
+        Self::encode_with_vec(&self.vec, bytes)
     }
 
     fn decode(bytes: &mut Bytes) -> Result<Self> {
@@ -109,9 +120,15 @@ impl BytesCodec for BytesHeader {
             true => Err(insufficient_bytes("BytesHeader::to")),
             false => {
                 let vec = bytes.split_to(size).to_vec();
-                Ok(BytesHeader { vec })
+                Ok(BytesPayload { vec })
             }
         }
+    }
+}
+
+impl Default for BytesPayload {
+    fn default() -> Self {
+        BytesPayload::from(Vec::new())
     }
 }
 

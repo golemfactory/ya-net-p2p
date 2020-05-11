@@ -11,10 +11,10 @@ use std::env;
 use std::net::SocketAddr;
 use std::time::Duration;
 use ya_core_model::ethaddr::NodeId;
+use ya_net::crypto::{Signature, SignatureECDSA};
 use ya_net::error::{CryptoError, MessageError};
 use ya_net::event::{ProtocolCmd, SendCmd, ServiceCmd};
-use ya_net::mangler::auth::AuthMangler;
-use ya_net::packet::{Guarantees, Payload};
+use ya_net::packet::{CryptoProcessor, Guarantees, Payload};
 use ya_net::protocol::kad::{KadBootstrapCmd, KadProtocol, NodeDataExt};
 use ya_net::protocol::session::SessionProtocol;
 use ya_net::transport::laminar::LaminarTransport;
@@ -87,7 +87,7 @@ impl Handler<ProtocolCmd<Key>> for ProtocolExample {
                 );
             }
             ProtocolCmd::SessionPacket(address, packet, key) => {
-                match packet.payload.try_payload::<String>() {
+                match packet.payload.decode_payload::<String>() {
                     Ok(message) => log::info!(
                         "SUCCESS: received a message from {:?} ({}): {}",
                         address,
@@ -114,11 +114,9 @@ impl Handler<ProtocolMessage<Key>> for ProtocolExample {
                 to: msg.to,
                 packet: Packet {
                     guarantees: Guarantees::unordered(),
-                    payload: Payload::builder(Self::PROTOCOL_ID)
-                        .try_payload(&msg.message)?
-                        .with_auth()
-                        .with_signature()
-                        .build(),
+                    payload: Payload::new(Self::PROTOCOL_ID)
+                        .encode_payload(&msg.message)?
+                        .with_signature(),
                 },
             })
             .await??;
@@ -158,17 +156,29 @@ impl Default for CryptoExample {
 }
 
 impl Crypto<Key> for CryptoExample {
-    const SIGNATURE_SIZE: usize = 0;
+    const SIGNATURE_SIZE: usize = 32;
 
-    fn encrypt<'a>(&self, _key: Key, payload: Vec<u8>) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+    fn encrypt<'a, P: AsRef<[u8]>>(
+        &self,
+        _key: Key,
+        payload: P,
+    ) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+        let payload = payload.as_ref().to_vec();
+        // FIXME: encrypt
         async move { Ok(payload) }.boxed_local()
     }
 
-    fn decrypt<'a>(&self, _key: Key, payload: Vec<u8>) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+    fn decrypt<'a, P: AsRef<[u8]>>(
+        &self,
+        _key: Key,
+        payload: P,
+    ) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+        let payload = payload.as_ref().to_vec();
+        // FIXME: decrypt
         async move { Ok(payload) }.boxed_local()
     }
 
-    fn sign<'a>(&self, key: Key, payload: Vec<u8>) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+    fn sign<'a>(&self, key: Key, payload: Vec<u8>) -> LocalBoxFuture<'a, Result<Signature>> {
         let public_key = match PublicKey::from_slice(key.as_ref()) {
             Ok(public_key) => public_key,
             _ => {
@@ -176,8 +186,8 @@ impl Crypto<Key> for CryptoExample {
                 return async move { Err(Error::key()) }.boxed_local();
             }
         };
-        let node_id = NodeId::from(public_key.address().as_ref());
 
+        let node_id = NodeId::from(public_key.address().as_ref());
         let secret = match self.identities.get(&node_id) {
             Some(entry) => &entry.0,
             None => {
@@ -190,14 +200,15 @@ impl Crypto<Key> for CryptoExample {
             }
         };
 
+        let key = Some(key.as_ref().to_vec());
         let signed = secret
             .sign(payload.as_slice())
             .map(|sig| {
-                let mut vec = Vec::with_capacity(33);
-                vec.push(sig.v);
-                vec.extend_from_slice(&sig.r[..]);
-                vec.extend_from_slice(&sig.s[..]);
-                vec
+                let mut data = Vec::with_capacity(33);
+                data.push(sig.v);
+                data.extend_from_slice(&sig.r[..]);
+                data.extend_from_slice(&sig.s[..]);
+                Signature::ECDSA(SignatureECDSA::P256K1 { data, key })
             })
             .map_err(|e| Error::from(MessageError::Signature(e.to_string())));
 
@@ -205,8 +216,14 @@ impl Crypto<Key> for CryptoExample {
     }
 
     #[inline]
-    fn verify(&self, key: Key, payload: Vec<u8>, signature: Vec<u8>) -> Result<bool> {
-        crypto::verify_secp256k1(key, payload, signature)
+    #[inline]
+    fn verify<H: AsRef<[u8]>>(
+        &self,
+        key: Option<Key>,
+        signature: &mut Signature,
+        hash: H,
+    ) -> Result<bool> {
+        crypto::verify_secp256k1(key, signature, hash)
     }
 }
 
@@ -233,14 +250,14 @@ async fn spawn_node<C: Crypto<Key> + 'static>(
         .collect::<Vec<_>>();
     let net = Net::new(socket_addrs).start();
 
-    let auth = AuthMangler::new(node.key.clone(), crypto).start();
+    let auth = CryptoProcessor::new(node.key.clone(), crypto).start();
     let kad = KadProtocol::new(node.clone(), net.clone().recipient()).start();
     let ses = SessionProtocol::new(net.clone().recipient(), net.clone().recipient()).start();
     let exa = ProtocolExample::new(net.clone().recipient()).start();
     let lam = LaminarTransport::<Key>::new(net.clone().recipient()).start();
 
     log::debug!("Adding manglers... [{}]", node.key);
-    net.send(ServiceCmd::AddMangler(auth.clone().recipient()))
+    net.send(ServiceCmd::AddProcessor(auth.clone().recipient()))
         .await??;
     log::debug!("Setting DHT protocol... [{}]", node.key);
     net.send(ServiceCmd::SetDhtProtocol(kad.clone().recipient()))

@@ -1,7 +1,7 @@
 use crate::common::FlattenResult;
 use crate::error::*;
 use crate::event::*;
-use crate::packet::{AddressedPacket, DeliveryType, EncodedPacket, Guarantees, OrderingType};
+use crate::packet::{AddressedPacket, DeliveryType, Guarantees, OrderingType, WirePacket};
 use crate::transport::Address;
 use crate::Result;
 use actix::prelude::*;
@@ -100,7 +100,7 @@ where
     fn send_packet(
         &self,
         socket_addr: SocketAddr,
-        packet: EncodedPacket,
+        packet: WirePacket,
     ) -> impl Future<Output = Result<()>> {
         let mut channel = match &self.message_sender {
             Some(channel) => channel.clone(),
@@ -165,7 +165,7 @@ where
                 let fut = self
                     .send_packet(
                         socket_addr,
-                        EncodedPacket {
+                        WirePacket {
                             guarantees: Guarantees::unordered(),
                             message: vec![],
                         },
@@ -327,7 +327,6 @@ where
             InternalRequest::Unbind => {
                 self.message_sender.take();
                 if let Some(control) = self.thread_control.take() {
-                    log::info!("Unbinding listeners");
                     control.stop();
                 }
             }
@@ -352,7 +351,7 @@ impl From<laminar::Packet> for AddressedPacket {
     fn from(packet: laminar::Packet) -> Self {
         AddressedPacket {
             address: Address::new(Address::LAMINAR, packet.addr()),
-            encoded: EncodedPacket {
+            encoded: WirePacket {
                 message: packet.payload().into(),
                 guarantees: Guarantees {
                     ordering: packet.order_guarantee().into(),

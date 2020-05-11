@@ -2,7 +2,6 @@ mod common;
 pub mod crypto;
 pub mod error;
 pub mod event;
-pub mod mangler;
 pub mod packet;
 pub mod protocol;
 mod serialize;
@@ -21,7 +20,7 @@ pub use service::*;
 
 pub use crypto::Crypto;
 pub use error::Error;
-pub use packet::{EncodedPacket, Packet};
+pub use packet::{Packet, WirePacket};
 pub use protocol::ProtocolId;
 pub use transport::{Address, TransportId};
 

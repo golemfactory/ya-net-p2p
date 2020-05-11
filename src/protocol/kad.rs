@@ -128,8 +128,8 @@ where
 
     fn handle(&mut self, msg: ProtocolCmd<Key<N>>, ctx: &mut Context<Self>) -> Self::Result {
         match msg {
-            ProtocolCmd::SessionPacket(address, packet, _)
-            | ProtocolCmd::RoamingPacket(address, packet) => {
+            ProtocolCmd::SessionPacket(address, mut packet, _)
+            | ProtocolCmd::RoamingPacket(address, mut packet) => {
                 let kad = match self.kad.addr() {
                     Ok(kad) => kad,
                     Err(err) => return actor_reply(err),
@@ -138,9 +138,10 @@ where
                 let fut = async move {
                     let key_vec = packet
                         .payload
-                        .auth()
-                        .cloned()
-                        .ok_or(MessageError::MissingAuth)?;
+                        .signature()
+                        .map(|sig| sig.key())
+                        .flatten()
+                        .ok_or(MessageError::MissingSignature("KadEvt".into()))?;
 
                     kad.send(KadEvtReceive {
                         from: Node {
@@ -148,7 +149,7 @@ where
                             data: D::from_address(address),
                         },
                         new: false,
-                        message: packet.payload.try_payload()?,
+                        message: packet.payload.decode_payload()?,
                     })
                     .await??;
 
@@ -331,11 +332,9 @@ where
 
     fn try_from(evt: KadEvtSend<N, D>) -> std::result::Result<Self, Self::Error> {
         Ok(Packet {
-            payload: Payload::builder(KadProtocol::<N, D>::PROTOCOL_ID)
-                .with_auth()
-                .with_signature()
-                .try_payload(&evt.message)?
-                .build(),
+            payload: Payload::new(KadProtocol::<N, D>::PROTOCOL_ID)
+                .encode_payload(&evt.message)?
+                .with_signature(),
             guarantees: Guarantees::unordered(),
         })
     }

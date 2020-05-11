@@ -45,7 +45,7 @@ where
 
     transports: HashMap<TransportId, Recipient<TransportCmd>>,
     protocols: HashMap<ProtocolId, Recipient<ProtocolCmd<Key>>>,
-    manglers: Vec<Recipient<MangleCmd<Key>>>,
+    processors: Vec<Recipient<ProcessCmd<Key>>>,
 
     session_protocol: Option<Recipient<SessionCmd<Key>>>,
     dht_protocol: Option<Recipient<DhtCmd<Key>>>,
@@ -69,7 +69,7 @@ where
             addresses: HashSet::from_iter(addresses.into_iter()),
             transports: HashMap::new(),
             protocols: HashMap::new(),
-            manglers: Vec::new(),
+            processors: Vec::new(),
             session_protocol: None,
             dht_protocol: None,
             pending_connections: HashMap::new(),
@@ -142,19 +142,19 @@ where
     Key: Clone + Unpin + Send + Debug + Hash + Eq + 'static,
 {
     #[inline]
-    fn mangle<'a>(
+    fn process_outbound<'a>(
         &self,
         from: Option<Key>,
         to: Option<Key>,
         packet: Packet,
     ) -> impl Future<Output = Result<Packet>> + 'a {
-        let iter = self.manglers.clone().into_iter();
+        let iter = self.processors.clone().into_iter();
         futures::stream::iter(iter)
             .map(move |recipient| (recipient, from.clone(), to.clone()))
             .fold(Ok(packet), move |res, (recipient, from, to)| async move {
                 match res {
                     Ok(packet) => recipient
-                        .send(MangleCmd::Mangle { from, to, packet })
+                        .send(ProcessCmd::Outbound { from, to, packet })
                         .await
                         .flatten_result(),
                     err => err,
@@ -163,19 +163,19 @@ where
     }
 
     #[inline]
-    fn unmangle<'a>(
+    fn process_inbound<'a>(
         &self,
         from: Option<Key>,
         to: Option<Key>,
         packet: Packet,
     ) -> impl Future<Output = Result<Packet>> + 'a {
-        let iter = self.manglers.clone().into_iter().rev();
+        let iter = self.processors.clone().into_iter().rev();
         futures::stream::iter(iter)
             .map(move |recipient| (recipient, from.clone(), to.clone()))
             .fold(Ok(packet), move |res, (recipient, from, to)| async move {
                 match res {
                     Ok(packet) => recipient
-                        .send(MangleCmd::Unmangle { from, to, packet })
+                        .send(ProcessCmd::Inbound { from, to, packet })
                         .await
                         .flatten_result(),
                     err => err,
@@ -264,13 +264,13 @@ where
                 };
                 ActorResponse::reply(result)
             }
-            ServiceCmd::AddMangler(recipient) => {
-                self.manglers.push(recipient);
+            ServiceCmd::AddProcessor(recipient) => {
+                self.processors.push(recipient);
                 ActorResponse::reply(Ok(()))
             }
-            ServiceCmd::RemoveMangler(recipient) => {
-                if let Some(idx) = self.manglers.iter().position(|r| r == &recipient) {
-                    self.manglers.remove(idx);
+            ServiceCmd::RemoveProcessor(recipient) => {
+                if let Some(idx) = self.processors.iter().position(|r| r == &recipient) {
+                    self.processors.remove(idx);
                 }
                 ActorResponse::reply(Ok(()))
             }
@@ -330,10 +330,10 @@ where
                 let fut = match conn {
                     Some(conn) => {
                         let mut conn = conn.clone();
-                        let mangle_fut = self.mangle(from, None, packet);
+                        let process_fut = self.process_outbound(from, None, packet);
 
                         async move {
-                            let packet = mangle_fut.await?;
+                            let packet = process_fut.await?;
                             conn.send(packet).await?;
                             Ok(())
                         }
@@ -472,9 +472,9 @@ where
                     }
                 };
 
-                let unmangle_fut = self.unmangle(key.clone(), None, packet);
+                let process_fut = self.process_inbound(key.clone(), None, packet);
                 let fut = async move {
-                    let packet = unmangle_fut.await?;
+                    let packet = process_fut.await?;
                     let command = match key {
                         Some(key) => ProtocolCmd::SessionPacket(address, packet, key),
                         None => ProtocolCmd::RoamingPacket(address, packet),
@@ -488,7 +488,7 @@ where
                     protocol.send(command).await??;
                     Ok(())
                 }
-                .map_err(|e: Error| log::error!("TransportEvent::Packet handler error: {:?}", e))
+                .map_err(|e: Error| log::error!("TransportEvent::Packet handler error: {}", e))
                 .map(|_| ());
 
                 ctx.spawn(fut.into_actor(self));
@@ -594,12 +594,12 @@ where
 
     fn handle(&mut self, evt: internal::Send<Key>, ctx: &mut Context<Self>) -> Self::Result {
         let session_fut = self.session(evt.to.clone(), ctx.address());
-        let mangle_fut = self.mangle(evt.from, Some(evt.to), evt.packet);
+        let process_fut = self.process_outbound(evt.from, Some(evt.to), evt.packet);
         let timeout = self.conf.session_timeout;
 
         ActorResponse::r#async(
             async move {
-                let packet = mangle_fut.await?;
+                let packet = process_fut.await?;
                 tokio::time::timeout(timeout, session_fut)
                     .await
                     .map_err(|_| Error::from(SessionError::Timeout))??

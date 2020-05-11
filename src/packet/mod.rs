@@ -1,12 +1,15 @@
 use crate::packet::codec::Codec;
-pub use crate::packet::payload::Payload;
 use crate::transport::StreamId;
 use crate::{Address, Result, TransportId};
 use std::net::SocketAddr;
 
+pub use crate::packet::payload::Payload;
+pub use crate::packet::processor::crypto::CryptoProcessor;
+
 pub(crate) mod codec;
 pub(crate) mod header;
 pub(crate) mod payload;
+pub mod processor;
 
 #[derive(Clone, Debug)]
 pub struct Packet {
@@ -15,12 +18,12 @@ pub struct Packet {
 }
 
 #[derive(Clone, Debug)]
-pub struct EncodedPacket {
+pub struct WirePacket {
     pub guarantees: Guarantees,
     pub message: Vec<u8>,
 }
 
-impl EncodedPacket {
+impl WirePacket {
     #[inline]
     pub fn addressed(self, address: Address) -> AddressedPacket {
         AddressedPacket {
@@ -41,16 +44,16 @@ impl EncodedPacket {
     pub fn try_decode(self) -> Result<Packet> {
         Ok(Packet {
             guarantees: self.guarantees,
-            payload: Payload::decode(self.message)?,
+            payload: Payload::decode_vec(self.message)?,
         })
     }
 }
 
-impl From<Packet> for EncodedPacket {
-    fn from(packet: Packet) -> Self {
-        EncodedPacket {
+impl From<Packet> for WirePacket {
+    fn from(mut packet: Packet) -> Self {
+        WirePacket {
             guarantees: packet.guarantees,
-            message: packet.payload.encode(),
+            message: packet.payload.encode_vec(),
         }
     }
 }
@@ -58,7 +61,7 @@ impl From<Packet> for EncodedPacket {
 #[derive(Clone, Debug)]
 pub struct AddressedPacket {
     pub address: Address,
-    pub encoded: EncodedPacket,
+    pub encoded: WirePacket,
 }
 
 #[derive(Clone, Debug)]

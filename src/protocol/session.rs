@@ -85,10 +85,7 @@ where
         match msg {
             SessionCmd::Initiate(address) => {
                 let packet = Packet {
-                    payload: Payload::builder(Self::PROTOCOL_ID)
-                        .with_auth()
-                        .with_signature()
-                        .build(),
+                    payload: Payload::new(Self::PROTOCOL_ID).with_signature(),
                     guarantees: Guarantees::ordered_default(),
                 };
 
@@ -117,20 +114,23 @@ where
 
     fn handle(&mut self, msg: ProtocolCmd<Key>, ctx: &mut Context<Self>) -> Self::Result {
         match msg {
-            ProtocolCmd::RoamingPacket(address, packet)
-            | ProtocolCmd::SessionPacket(address, packet, _) => {
+            ProtocolCmd::RoamingPacket(address, mut packet)
+            | ProtocolCmd::SessionPacket(address, mut packet, _) => {
                 let sender = self.events.clone();
-                let auth = match packet.payload.auth() {
-                    Some(auth) => auth,
-                    None => {
-                        log::warn!("No auth info in packet");
+
+                let key_vec = match packet.payload.signature().map(|sig| sig.key()).flatten() {
+                    Some(key_vec) => key_vec,
+                    _ => {
+                        log::warn!("Missing key / signature in packet");
                         return ActorResponse::reply(Ok(()));
                     }
                 };
-                let key = match Key::try_from(auth.clone()) {
+
+                let key = match Key::try_from(key_vec) {
                     Ok(key) => key,
                     Err(e) => return ActorResponse::reply(Err(e.into())),
                 };
+
                 let fut = sender
                     .send(SessionEvt::Established(address, key))
                     .map(|_| Ok(()));

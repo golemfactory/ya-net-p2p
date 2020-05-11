@@ -1,6 +1,6 @@
 use crate::common::FutureState;
 use crate::error::SessionError;
-use crate::packet::EncodedPacket;
+use crate::packet::WirePacket;
 use crate::transport::connection::{Connection, ConnectionMap};
 use crate::transport::Address;
 use crate::Result;
@@ -119,7 +119,7 @@ where
     Key: Clone + Debug + 'static,
 {
     #[inline]
-    pub fn send<P: Into<EncodedPacket> + 'static>(
+    pub fn send<P: Into<WirePacket> + 'static>(
         &self,
         packet: P,
     ) -> impl Future<Output = Result<()>> + 'static {

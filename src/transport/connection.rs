@@ -1,7 +1,7 @@
 use crate::error::{ChannelError, SessionError};
 use crate::packet::AddressedPacket;
 use crate::transport::Address;
-use crate::{EncodedPacket, Result};
+use crate::{Result, WirePacket};
 use futures::channel::mpsc::Sender;
 use futures::{Future, SinkExt, TryFutureExt};
 use hashbrown::HashMap;
@@ -45,7 +45,7 @@ impl<Ctx: Clone + Debug> Connection<Ctx> {
     }
 
     #[inline]
-    pub fn send<'s, P: Into<EncodedPacket> + 'static>(
+    pub fn send<'s, P: Into<WirePacket> + 'static>(
         &mut self,
         packet: P,
     ) -> impl Future<Output = Result<()>> + 'static {

@@ -59,8 +59,10 @@ pub enum MessageError {
     Signature(String),
     #[error("missing auth")]
     MissingAuth,
-    #[error("missing signature")]
-    MissingSignature,
+    #[error("missing signature: {0}")]
+    MissingSignature(String),
+    #[error("unsupported signature")]
+    UnsupportedSignature,
 }
 
 #[derive(thiserror::Error, Clone, Debug)]
@@ -77,6 +79,8 @@ pub enum ChannelError {
 pub enum CryptoError {
     #[error("invalid key")]
     InvalidKey,
+    #[error("invalid scheme")]
+    InvalidScheme,
 }
 
 #[derive(thiserror::Error, Clone, Debug)]
