@@ -1,4 +1,4 @@
-use crate::event::{EvtRequest, KadMessage};
+use crate::event::{KadMessage, QueryEvtRequest};
 use crate::message;
 use crate::{Kad, Key, KeyLen, Node, NodeData, ALPHA};
 use actix::prelude::*;
@@ -164,7 +164,7 @@ where
                     }),
                 };
 
-                if let Err(e) = address.send(EvtRequest { to, message }).await {
+                if let Err(e) = address.send(QueryEvtRequest { to, message }).await {
                     log::error!("Unable to send query message: {:?}", e);
                 }
             }

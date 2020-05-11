@@ -163,7 +163,7 @@ where
         std::mem::replace(&mut self.ping_backlog, HashSet::new())
             .drain()
             .for_each(|node| match events.len() < self.conf.ping_max_concurrent {
-                true => events.push(EvtRequest {
+                true => events.push(QueryEvtRequest {
                     to: node,
                     message: KadMessage::from(message::Ping { rand_val: 0 }),
                 }),
@@ -363,7 +363,9 @@ where
         ActorResponse::r#async(
             async move {
                 if let Some(message) = handler_fut.await? {
-                    address.send(EvtRespond { to: from, message }).await??;
+                    address
+                        .send(QueryEvtRespond { to: from, message })
+                        .await??;
                 }
                 Ok(())
             }
@@ -649,7 +651,7 @@ where
     }
 }
 
-impl<N, D> Handler<EvtRequest<N, D>> for Kad<N, D>
+impl<N, D> Handler<QueryEvtRequest<N, D>> for Kad<N, D>
 where
     N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
@@ -657,7 +659,7 @@ where
 {
     type Result = ActorResponse<Self, (), Error>;
 
-    fn handle(&mut self, mut evt: EvtRequest<N, D>, _: &mut Context<Self>) -> Self::Result {
+    fn handle(&mut self, mut evt: QueryEvtRequest<N, D>, _: &mut Context<Self>) -> Self::Result {
         // Transform port for non-UDP & fixed-port operating mode?
         log::trace!("{} tx {} to {}", self.conf.name, evt.message, evt.to);
 
@@ -677,7 +679,7 @@ where
     }
 }
 
-impl<N, D> Handler<EvtRespond<N, D>> for Kad<N, D>
+impl<N, D> Handler<QueryEvtRespond<N, D>> for Kad<N, D>
 where
     N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
@@ -685,7 +687,7 @@ where
 {
     type Result = ActorResponse<Self, (), Error>;
 
-    fn handle(&mut self, evt: EvtRespond<N, D>, _: &mut Context<Self>) -> Self::Result {
+    fn handle(&mut self, evt: QueryEvtRespond<N, D>, _: &mut Context<Self>) -> Self::Result {
         log::trace!("{} tx {} to {}", self.conf.name, evt.message, evt.to);
 
         ActorResponse::r#async(self.send(evt.to, evt.message).into_actor(self))

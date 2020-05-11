@@ -53,14 +53,14 @@ pub struct KadEvtBootstrap<N: KeyLen, D: NodeData> {
 
 #[derive(Clone, Debug, Message)]
 #[rtype(result = "Result<()>")]
-pub(crate) struct EvtRequest<N: KeyLen, D: NodeData> {
+pub(crate) struct QueryEvtRequest<N: KeyLen, D: NodeData> {
     pub to: Node<N, D>,
     pub message: KadMessage,
 }
 
 #[derive(Clone, Debug, Message)]
 #[rtype(result = "Result<()>")]
-pub(crate) struct EvtRespond<N: KeyLen, D: NodeData> {
+pub(crate) struct QueryEvtRespond<N: KeyLen, D: NodeData> {
     pub to: Node<N, D>,
     pub message: KadMessage,
 }
