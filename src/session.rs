@@ -68,6 +68,7 @@ where
                 SessionState::Established(key)
             }
             SessionState::Established(key) => {
+                conn.set_ctx(key.clone());
                 Self::connected(&mut *connections, conn);
                 SessionState::Established(key)
             }
@@ -80,6 +81,7 @@ where
     }
 
     pub fn remove_by_address(&mut self, address: &Address) {
+        let established = self.is_established();
         let empty = {
             let mut connections = self.connections.lock().unwrap();
             if let Some(_) = connections.remove(&address) {
@@ -88,21 +90,21 @@ where
             connections.is_empty()
         };
 
-        if empty && self.is_established() {
+        if established && empty {
             self.terminate();
         }
     }
 
     pub fn terminate(&mut self) {
+        let key = { self.key() };
         let mut state = self.state.lock().unwrap();
-        let key = self.key();
         log::debug!("Terminating session {:?}", key);
 
         match std::mem::replace(&mut (*state), SessionState::Terminated(key)) {
             SessionState::Terminated(_) => return,
             _ => {
                 (*self.connections.lock().unwrap()).clear();
-                (*self.future_state.lock().unwrap()).ready(false)
+                (*self.future_state.lock().unwrap()).ready(false);
             }
         };
     }

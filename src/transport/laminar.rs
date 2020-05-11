@@ -65,6 +65,7 @@ impl ThreadControl {
 
     fn stop(self) {
         let _ = self.tx.send(());
+        self.arbiter.stop();
     }
 }
 
@@ -303,7 +304,6 @@ where
 
                         while let Ok(socket_evt) = socket_receiver.try_recv() {
                             match actor
-                                .clone()
                                 .send(LaminarEvent(socket_evt))
                                 .map_err(Error::from)
                                 .await
