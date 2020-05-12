@@ -28,32 +28,35 @@ impl<N: KeyLen + 'static, D: NodeData + 'static> Table<N, D> {
         }
     }
 
-    pub fn add(&mut self, node: &Node<N, D>) -> bool {
-        let idx = self.bucket_index(&node.key);
-        let len = self.buckets.len();
-        let bucket = &mut self.buckets[idx];
+    pub fn add(&mut self, node: &Node<N, D>) -> AddNodeStatus {
+        if node.key == self.key {
+            return AddNodeStatus::Replaced;
+        }
 
-        if node.key == self.key || bucket.add(node) {
-            true
+        let bucket_idx = self.bucket_index(&node.key);
+        let bucket_count = self.buckets.len();
+        let bucket = &mut self.buckets[bucket_idx];
+        let add_result = bucket.add(node);
+
+        if add_result.success() {
+            add_result
         // middle bucket
-        } else if idx != len - 1 {
-            let furthest_key = match bucket.furthest(&self.key) {
-                Some(node) => node.key.clone(),
-                None => return false,
-            };
-            if furthest_key.distance(&self.key) >= node.distance(&self.key) {
-                bucket.remove(&furthest_key);
-                return bucket.add(node);
+        } else if bucket_idx != bucket_count - 1 {
+            if let Some(furthest) = bucket.furthest(&self.key) {
+                if furthest.distance(&self.key) >= node.distance(&self.key) {
+                    let key = furthest.key.clone();
+                    bucket.remove(&key);
+                    return bucket.add(node);
+                }
+                bucket.queue.push(node.clone());
             }
-
-            bucket.queue.push(node.clone());
-            false
+            AddNodeStatus::Rejected
         // table full
-        } else if len == self.table_size {
-            false
+        } else if bucket_count == self.table_size {
+            AddNodeStatus::Rejected
         // split the last bucket
         } else {
-            self.split(idx);
+            self.split(bucket_idx);
             self.add(node)
         }
     }
@@ -66,7 +69,7 @@ impl<N: KeyLen + 'static, D: NodeData + 'static> Table<N, D> {
     }
 
     #[inline]
-    pub fn remove(&mut self, key: &Key<N>) {
+    pub fn remove(&mut self, key: &Key<N>) -> Option<Node<N, D>> {
         let idx = self.bucket_index(&key);
         self.buckets[idx].remove(key)
     }
@@ -90,7 +93,7 @@ impl<N: KeyLen + 'static, D: NodeData + 'static> Table<N, D> {
         let max = max.unwrap_or(self.bucket_size);
         let mut result = Vec::new();
 
-        let _ = AlternatingIter::new(self.bucket_index(key), self.buckets.len()).try_fold(
+        let _ = BucketIndexIter::new(self.bucket_index(key), self.buckets.len()).try_fold(
             0 as usize,
             |acc, i| {
                 result.extend(
@@ -102,10 +105,9 @@ impl<N: KeyLen + 'static, D: NodeData + 'static> Table<N, D> {
                         .cloned(),
                 );
 
-                if result.len() == max {
-                    Err(())
-                } else {
-                    Ok(result.len())
+                match result.len() == max {
+                    false => Ok(result.len()),
+                    true => Err(()),
                 }
             },
         );
@@ -159,15 +161,32 @@ impl<N: KeyLen + 'static, D: NodeData + 'static> Table<N, D> {
     }
 }
 
-struct AlternatingIter {
+#[derive(Clone, Debug)]
+pub enum AddNodeStatus {
+    Accepted,
+    Replaced,
+    Rejected,
+}
+
+impl AddNodeStatus {
+    #[inline]
+    pub fn success(&self) -> bool {
+        match self {
+            AddNodeStatus::Rejected => false,
+            _ => true,
+        }
+    }
+}
+
+struct BucketIndexIter {
     start: usize,
     len: usize,
     idx: Option<usize>,
 }
 
-impl AlternatingIter {
+impl BucketIndexIter {
     pub fn new(start: usize, len: usize) -> Self {
-        AlternatingIter {
+        BucketIndexIter {
             start,
             len,
             idx: None,
@@ -175,7 +194,7 @@ impl AlternatingIter {
     }
 }
 
-impl Iterator for AlternatingIter {
+impl Iterator for BucketIndexIter {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -259,25 +278,34 @@ impl<N: KeyLen, D: NodeData> Bucket<N, D> {
         }
     }
 
-    fn add(&mut self, node: &Node<N, D>) -> bool {
+    fn add(&mut self, node: &Node<N, D>) -> AddNodeStatus {
         self.updated = Utc::now();
+        let mut result;
 
-        self.remove(&node.key);
-        if self.nodes.len() < self.size {
-            self.nodes.push(node.clone());
-            return true;
+        if self.remove(&node.key).is_some() {
+            result = AddNodeStatus::Replaced;
+        } else {
+            result = AddNodeStatus::Accepted;
         }
 
-        false
+        if self.nodes.len() < self.size {
+            self.nodes.push(node.clone());
+        } else {
+            result = AddNodeStatus::Rejected
+        }
+
+        result
     }
 
-    fn remove(&mut self, key: &Key<N>) {
+    fn remove(&mut self, key: &Key<N>) -> Option<Node<N, D>> {
         if let Some(idx) = self.nodes.iter().position(|node| &node.key == key) {
-            self.nodes.remove(idx);
+            let removed = self.nodes.remove(idx);
             if let Some(queued) = self.queue.pop() {
                 self.add(&queued);
             }
+            return Some(removed);
         }
+        None
     }
 
     fn split(&mut self, key: &Key<N>, idx: usize) -> Bucket<N, D> {
@@ -310,23 +338,23 @@ mod test {
         }
 
         let vec: Vec<[i32; 3]> = vec![];
-        let iter = AlternatingIter::new(0, vec.len());
+        let iter = BucketIndexIter::new(0, vec.len());
         assert_eq!(vec![0], iter.collect::<Vec<_>>());
 
         let vec = vec![[1, 2, 3]];
-        let iter = AlternatingIter::new(0, vec.len());
+        let iter = BucketIndexIter::new(0, vec.len());
         assert_eq!(gather(iter, &vec), (1..4).collect::<Vec<_>>());
 
         let vec = vec![[1, 2, 3], [4, 5, 6]];
-        let iter = AlternatingIter::new(0, vec.len());
+        let iter = BucketIndexIter::new(0, vec.len());
         assert_eq!(gather(iter, &vec), (1..7).collect::<Vec<_>>());
 
         let vec = vec![[4, 5, 6], [1, 2, 3]];
-        let iter = AlternatingIter::new(1, vec.len());
+        let iter = BucketIndexIter::new(1, vec.len());
         assert_eq!(gather(iter, &vec), (1..7).collect::<Vec<_>>());
 
         let vec = vec![[13, 14, 15], [7, 8, 9], [1, 2, 3], [4, 5, 6], [10, 11, 12]];
-        let iter = AlternatingIter::new(2, vec.len());
+        let iter = BucketIndexIter::new(2, vec.len());
         assert_eq!(gather(iter, &vec), (1..16).collect::<Vec<_>>());
     }
 }

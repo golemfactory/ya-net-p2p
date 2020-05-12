@@ -40,6 +40,8 @@ pub enum Error {
     InvalidNodeData,
     #[error("Serialization error: {0}")]
     SerializationError(String),
+    #[error("No message recipients")]
+    NoRecipients,
 }
 
 impl Error {
