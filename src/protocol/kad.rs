@@ -105,7 +105,7 @@ where
                     let result = kad
                         .send(KadFindNode::new(key.clone()))
                         .await??
-                        .ok_or(Error::from(DiscoveryError::NotFound(key.to_string())))?;
+                        .ok_or(Error::from(DiscoveryError::NotFound))?;
 
                     let addresses = result.data.addresses();
                     match addresses.is_empty() {
@@ -127,7 +127,7 @@ where
                     let (_, value) = kad
                         .send(KadFindValue { key })
                         .await??
-                        .ok_or(Error::from(DiscoveryError::NotFound(hex_key.clone())))?;
+                        .ok_or(Error::from(DiscoveryError::NotFound))?;
 
                     log::debug!("Resolved value {}: {:?}", hex_key, value);
                     Ok(DhtResponse::Value(value))
@@ -180,7 +180,7 @@ where
                         .signature()
                         .map(|sig| sig.key())
                         .flatten()
-                        .ok_or(MessageError::MissingSignature("Kad message".into()))?;
+                        .ok_or(MessageError::MissingSignature)?;
 
                     kad.send(KadReceive {
                         from: Node {

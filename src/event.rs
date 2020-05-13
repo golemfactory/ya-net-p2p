@@ -1,8 +1,10 @@
+use crate::error::DiscoveryError;
 use crate::packet::{AddressedPacket, Packet, WirePacket};
 use crate::transport::Address;
 use crate::{ProtocolId, Result, TransportId};
 use actix::prelude::*;
 use futures::channel::mpsc::Sender;
+use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::net::SocketAddr;
 
@@ -109,17 +111,20 @@ pub enum DhtResponse {
 }
 
 impl DhtResponse {
-    pub fn into_addresses(self) -> Option<Vec<Address>> {
+    pub fn into_addresses(self) -> Result<Vec<Address>> {
         match self {
-            DhtResponse::Addresses(addrs) => Some(addrs),
-            _ => None,
+            DhtResponse::Addresses(addrs) => match addrs.len() {
+                0 => Err(DiscoveryError::NotFound.into()),
+                _ => Ok(addrs),
+            },
+            _ => Err(DiscoveryError::NotFound.into()),
         }
     }
 
-    pub fn into_value(self) -> Option<Vec<u8>> {
+    pub fn into_value(self) -> Result<Vec<u8>> {
         match self {
-            DhtResponse::Value(vec) => Some(vec),
-            _ => None,
+            DhtResponse::Value(vec) => Ok(vec),
+            _ => Err(DiscoveryError::NotFound.into()),
         }
     }
 }
@@ -161,11 +166,12 @@ where
     Key: Send + Debug + Clone,
 {
     Established(Address, Key),
+    Disconnected(Key),
 }
 
 unsafe impl<Key> Send for SessionEvt<Key> where Key: Send + Debug + Clone {}
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DisconnectReason {
     Timeout,
     InvalidProtocol,

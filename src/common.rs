@@ -7,6 +7,7 @@ use std::pin::Pin;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 pub trait FlattenResult<T, E> {
     fn flatten_result(self) -> Result<T, E>;
@@ -22,18 +23,12 @@ impl<T, E, Ex: Into<E>> FlattenResult<T, E> for Result<Result<T, E>, Ex> {
 }
 
 pub struct TriggerFut<T: Clone> {
+    pub created_at: Instant,
     future_state: Arc<Mutex<FutureState<T>>>,
     future_id: usize,
 }
 
 impl<T: Clone> TriggerFut<T> {
-    pub fn new() -> Self {
-        TriggerFut {
-            future_state: Arc::new(Mutex::new(FutureState::default())),
-            future_id: usize::max_value(),
-        }
-    }
-
     pub fn is_pending(&self) -> bool {
         (*self.future_state.lock().unwrap()).value.is_none()
     }
@@ -41,6 +36,16 @@ impl<T: Clone> TriggerFut<T> {
     pub fn ready(&mut self, value: T) {
         if self.is_pending() {
             (*self.future_state.lock().unwrap()).ready(value);
+        }
+    }
+}
+
+impl<T: Clone> Default for TriggerFut<T> {
+    fn default() -> Self {
+        TriggerFut {
+            created_at: Instant::now(),
+            future_state: Arc::new(Mutex::new(FutureState::default())),
+            future_id: usize::max_value(),
         }
     }
 }
@@ -54,6 +59,7 @@ impl<T: Clone> Debug for TriggerFut<T> {
 impl<T: Clone> Clone for TriggerFut<T> {
     fn clone(&self) -> Self {
         TriggerFut {
+            created_at: self.created_at.clone(),
             future_state: self.future_state.clone(),
             future_id: self.future_state.lock().unwrap().next_id(),
         }

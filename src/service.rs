@@ -1,10 +1,10 @@
-use crate::common::{FlattenResult, TriggerFut};
-use crate::error::{DiscoveryError, Error, NetworkError, SessionError};
+use crate::common::FlattenResult;
+use crate::error::{Error, NetworkError, SessionError};
 use crate::event::*;
 use crate::packet::Packet;
 use crate::protocol::ProtocolId;
 use crate::session::Session;
-use crate::transport::connection::{Connection, ConnectionMode};
+use crate::transport::connection::{ConnectionManager, PendingConnection};
 use crate::transport::{Address, TransportId};
 use crate::Result;
 use actix::prelude::*;
@@ -14,7 +14,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::iter::FromIterator;
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub struct NetConfig {
@@ -50,8 +50,7 @@ where
     session_protocol: Option<Recipient<SessionCmd<Key>>>,
     dht_protocol: Option<Recipient<DhtCmd<Key>>>,
 
-    pending_connections: HashMap<Address, (Instant, TriggerFut<Result<Address>>)>,
-    connections: HashMap<Address, Connection<Key>>,
+    connections: ConnectionManager<Key>,
     sessions: HashMap<Key, Session<Key>>,
 }
 
@@ -72,8 +71,7 @@ where
             processors: Vec::new(),
             session_protocol: None,
             dht_protocol: None,
-            pending_connections: HashMap::new(),
-            connections: HashMap::new(),
+            connections: ConnectionManager::default(),
             sessions: HashMap::new(),
         }
     }
@@ -88,12 +86,11 @@ where
         key: Key,
         actor: Addr<Self>,
     ) -> impl Future<Output = Result<Session<Key>>> {
-        if let Some(session) = self.sessions.get(&key) {
-            let cloned = session.clone();
-            return async move { Ok(cloned.await?) }.left_future();
+        if let Some(session) = self.sessions.get(&key).cloned() {
+            return async move { Ok(session.await?) }.left_future();
         }
 
-        let session = self
+        let mut session = self
             .sessions
             .entry(key.clone())
             .or_insert(Session::new(key.clone()))
@@ -105,42 +102,27 @@ where
         async move {
             let dht = dht.ok_or_else(|| Error::protocol("No discovery protocol"))?;
             let proto = proto.ok_or_else(|| Error::protocol("No session protocol"))?;
-
             let addresses = dht
                 .send(DhtCmd::ResolveNode(key.clone()))
                 .await??
-                .into_addresses()
-                .ok_or_else(|| DiscoveryError::Timeout)?;
-            let conns = actor.send(internal::Connect(addresses)).await??;
-            let address = futures::future::select_ok(conns).await?.0;
+                .into_addresses()?;
+            let conns = actor.send(internal::Connect::new(addresses)).await??;
 
-            actor
-                .send(internal::AddConnectionToSession(address, key))
+            session
+                .add_future_connection(conns, |conn| {
+                    proto
+                        .send(SessionCmd::Initiate(conn.address))
+                        .map(|r| r.flatten_result())
+                })
                 .await?;
-            session.clone().await?;
-            proto.send(SessionCmd::Initiate(address)).await??;
 
-            Ok(session)
+            Ok(session.await?)
         }
         .right_future()
     }
 
     fn upkeep(&mut self, _: &mut Context<Self>) {
-        let now = Instant::now();
-        let duration = self.conf.connection_timeout;
-
-        self.pending_connections
-            .drain_filter(|_, (time, _)| duration < now - *time)
-            .for_each(|(addr, (_, mut trigger))| {
-                if trigger.is_pending() {
-                    log::debug!(
-                        "Connection to {:?} timed out after {}s",
-                        addr,
-                        duration.as_secs()
-                    );
-                    trigger.ready(Err(Error::from(NetworkError::Timeout)))
-                }
-            });
+        self.connections.prune_pending(self.conf.connection_timeout);
     }
 }
 
@@ -286,6 +268,11 @@ where
 
                 let actor = ctx.address();
 
+                std::mem::replace(&mut self.connections, ConnectionManager::default());
+                std::mem::replace(&mut self.sessions, HashMap::new())
+                    .into_iter()
+                    .for_each(|(_, mut s)| s.terminate());
+
                 let protocols_fut = std::mem::replace(&mut self.protocols, HashMap::new())
                     .into_iter()
                     .map(|(_, v)| v.send(ProtocolCmd::Shutdown));
@@ -323,14 +310,14 @@ where
                 log::debug!("Send roaming message to: {:?}", to);
 
                 let conn = match to.transport_id {
-                    Address::ANY_TRANSPORT => self
-                        .transports
-                        .keys()
-                        .filter_map(|id| {
+                    Address::ANY_TRANSPORT => {
+                        let keys = self.transports.keys();
+                        keys.filter_map(|id| {
                             to.transport_id = *id;
                             self.connections.get(&to)
                         })
-                        .next(),
+                        .next()
+                    }
                     _ => self.connections.get(&to),
                 };
 
@@ -351,10 +338,15 @@ where
                         let addresses = vec![to.clone()];
 
                         async move {
-                            let conns = actor.send(internal::Connect(addresses)).await??;
-                            futures::future::select_ok(conns.into_iter()).await?;
-                            actor.send(SendCmd::Roaming { from, to, packet }).await??;
-                            Ok(())
+                            let conns = actor.send(internal::Connect::new(addresses)).await??;
+                            let conn = futures::future::select_ok(conns.into_iter()).await?.0;
+                            actor
+                                .send(SendCmd::Roaming {
+                                    from,
+                                    to: conn.address,
+                                    packet,
+                                })
+                                .await?
                         }
                         .right_future()
                     }
@@ -371,9 +363,12 @@ where
                 ActorResponse::r#async(fut.into_actor(self))
             }
             SendCmd::Broadcast { from, packet } => {
-                let actor = ctx.address();
+                if self.sessions.is_empty() {
+                    return ActorResponse::reply(Err(NetworkError::NoConnection.into()));
+                }
 
-                let fut_vec = self
+                let actor = ctx.address();
+                let futs = self
                     .sessions
                     .values()
                     .map(|s| {
@@ -385,30 +380,25 @@ where
                     })
                     .collect::<Vec<_>>();
 
-                match fut_vec.len() {
-                    0 => ActorResponse::reply(Err(NetworkError::NoConnection.into())),
-                    _ => {
-                        Arbiter::spawn(async move {
-                            let _ = futures::future::join_all(fut_vec.into_iter()).await;
-                        });
-                        ActorResponse::reply(Ok(()))
-                    }
-                }
+                Arbiter::spawn(async move {
+                    let _ = futures::future::join_all(futs.into_iter()).await;
+                });
+                ActorResponse::reply(Ok(()))
             }
             SendCmd::Disconnect(key, reason) => {
-                let actor = ctx.address();
-                let protocol = self.session_protocol.clone();
+                if !self.sessions.contains_key(&key) {
+                    return ActorResponse::reply(Ok(()));
+                }
 
+                let protocol = self.session_protocol.clone();
                 let fut = async move {
                     if let Some(protocol) = protocol {
                         protocol
                             .send(SessionCmd::Disconnect(key.clone(), reason))
                             .await??;
                     }
-                    actor.send(internal::RemoveSession(key)).await?;
                     Ok(())
                 };
-
                 ActorResponse::r#async(fut.into_actor(self))
             }
         }
@@ -424,28 +414,18 @@ where
     fn handle(&mut self, msg: TransportEvt, ctx: &mut Context<Self>) -> Self::Result {
         match msg {
             TransportEvt::Connected(address, channel) => {
-                // FIXME: connection mode
-                let conn = Connection::new(address, channel, ConnectionMode::Direct);
-                self.connections.insert(conn.address, conn);
-
-                if let Some((_, mut pending)) = self.pending_connections.remove(&address) {
-                    log::debug!("Connected to {:?} (outbound)", address);
-                    pending.ready(Ok(address));
-                } else {
-                    log::debug!("Connected to {:?} (inbound)", address);
-                }
+                log::debug!("Connected to {:?}", address);
+                self.connections.connected(address, channel);
             }
             TransportEvt::Disconnected(address, reason) => {
-                if let Some((_, mut trigger)) = self.pending_connections.remove(&address) {
-                    trigger.ready(Err(Error::from(NetworkError::NoConnection)));
-                }
-
-                if let Some(conn) = self.connections.remove(&address) {
-                    log::debug!("Disconnected from {:?}: {:?}", address, reason);
-
+                log::debug!("Disconnected from {:?}: {:?}", address, reason);
+                if let Some(conn) = self.connections.disconnected(&address) {
                     if let Some(key) = conn.ctx() {
                         if let Some(session) = self.sessions.get_mut(&key) {
-                            session.remove_by_address(&address);
+                            session.remove_connection(&conn);
+                            if !session.is_alive() {
+                                self.sessions.remove(&key);
+                            }
                         }
                     }
                 }
@@ -464,7 +444,6 @@ where
                     }
                 };
                 let key = self.connections.get(&address).map(|c| c.ctx()).flatten();
-
                 let protocol_id = packet.payload.protocol_id();
                 let protocol = match self.protocols.get(&protocol_id).cloned() {
                     Some(protocol) => protocol,
@@ -487,11 +466,7 @@ where
                         None => ProtocolCmd::RoamingPacket(address, packet),
                     };
 
-                    log::debug!(
-                        "Routing packet from {:?} to protocol {}",
-                        address,
-                        protocol_id
-                    );
+                    log::debug!("Protocol {} message ({:?})", protocol_id, address,);
                     protocol.send(command).await??;
                     Ok(())
                 }
@@ -518,7 +493,7 @@ where
                     self.sessions
                         .entry(key.clone())
                         .or_insert_with(|| Session::new(key))
-                        .add_connection(conn.clone())
+                        .add_connection(conn.clone());
                 }
                 _ => {
                     log::warn!(
@@ -528,56 +503,53 @@ where
                     );
                 }
             },
+            SessionEvt::Disconnected(key) => {
+                match self.sessions.remove(&key) {
+                    Some(mut session) => {
+                        session.addresses().into_iter().for_each(|a| {
+                            self.connections.disconnected(&a);
+                        });
+                        session.terminate();
+                    }
+                    None => return,
+                };
+            }
         }
     }
 }
 
-impl<Key> Handler<internal::Connect> for Net<Key>
+impl<Key> Handler<internal::Connect<Key>> for Net<Key>
 where
     Key: Unpin + Send + Clone + Debug + Hash + Eq + 'static,
 {
-    type Result = <internal::Connect as Message>::Result;
+    type Result = <internal::Connect<Key> as Message>::Result;
 
-    fn handle(&mut self, evt: internal::Connect, ctx: &mut Context<Self>) -> Self::Result {
+    fn handle(&mut self, evt: internal::Connect<Key>, ctx: &mut Context<Self>) -> Self::Result {
         let mut addresses = Vec::new();
         let mut triggers = Vec::new();
         let mut futs = Vec::new();
 
-        evt.0.into_iter().for_each(|addr| match addr.transport_id {
-            Address::ANY_TRANSPORT => {
-                self.transports
-                    .keys()
-                    .for_each(|id| addresses.push(Address::new(*id, addr.socket_addr)));
-            }
-            _ => addresses.push(addr),
-        });
+        evt.addresses
+            .into_iter()
+            .for_each(|addr| match addr.transport_id {
+                Address::ANY_TRANSPORT => addresses.extend(
+                    self.transports
+                        .keys()
+                        .map(|id| Address::new(*id, addr.socket_addr)),
+                ),
+                _ => addresses.push(addr),
+            });
 
-        log::debug!("Requested connection to {:?}", addresses);
+        log::debug!("Connecting to addresses: {:?}", addresses);
 
         addresses.into_iter().for_each(|address| {
             if let Some(recipient) = self.transports.get(&address.transport_id) {
-                let is_pending = self.pending_connections.contains_key(&address);
-                let is_connected = self.connections.contains_key(&address);
-
-                let trigger = &mut self
-                    .pending_connections
-                    .entry(address)
-                    .or_insert_with(|| (Instant::now(), TriggerFut::new()))
-                    .1;
-
-                match (is_connected, is_pending) {
-                    (true, _) => {
-                        log::debug!("Connection to {:?} already established", address);
-                        trigger.ready(Ok(address));
-                    }
-                    (_, false) => {
-                        log::debug!("Connecting to {:?}", address);
-                        futs.push(recipient.send(TransportCmd::Connect(address.socket_addr)))
-                    }
-                    _ => {}
+                let pending = self.connections.pending(address);
+                if let PendingConnection::New(_) = &pending {
+                    log::debug!("Connecting to {:?}", address);
+                    futs.push(recipient.send(TransportCmd::Connect(address.socket_addr)));
                 }
-
-                triggers.push(trigger.clone());
+                triggers.push(pending.into());
             };
         });
 
@@ -635,46 +607,25 @@ macro_rules! impl_internal_handler {
 impl_internal_handler!(internal::Shutdown, (self, _evt, ctx) {
     ctx.stop();
 });
+
 impl_internal_handler!(internal::AddTransport, (self, evt, _ctx) {
     let (transport_id, recipient) = (evt.0, evt.1);
     self.transports.insert(transport_id, recipient);
 });
+
 impl_internal_handler!(internal::RemoveTransport, (self, evt, _ctx) {
     let transport_id = evt.0;
     self.transports.remove(&transport_id);
 });
-impl_internal_handler!(internal::RemoveConnection, (self, evt, _ctx) {
-    let address = evt.0;
-    self.connections.remove(&address);
-});
-impl_internal_handler!(internal::AddSession<Key>, (self, evt, _ctx) {
-    let session = evt.0;
-    self.sessions.insert(session.key(), session);
-});
-impl_internal_handler!(internal::RemoveSession<Key>, (self, evt, _ctx) {
-    let key = evt.0;
-    if let Some(mut session) = self.sessions.remove(&key) {
-        session.terminate();
-    }
-});
-impl_internal_handler!(internal::AddConnectionToSession<Key>, (self, evt, _ctx) {
-    let address = evt.0;
-    let key = evt.1;
-    if let Some(conn) = self.connections.get(&address) {
-        if let Some(session) = self.sessions.get_mut(&key) {
-            session.add_connection(conn.clone());
-        }
-    }
-});
 
 mod internal {
-    use crate::common::TriggerFut;
     use crate::event::TransportCmd;
     use crate::packet::Packet;
-    use crate::session::Session;
+    use crate::transport::connection::ConnectionFut;
     use crate::transport::Address;
     use crate::{Result, TransportId};
     use actix::prelude::*;
+    use serde::export::PhantomData;
     use std::fmt::Debug;
 
     #[derive(Clone, Debug, Message)]
@@ -687,27 +638,23 @@ mod internal {
 
     #[derive(Clone, Debug, Message)]
     #[rtype(result = "()")]
-    pub struct RemoveConnection(pub Address);
-
-    #[derive(Clone, Debug, Message)]
-    #[rtype(result = "()")]
-    pub struct AddSession<Key: Clone + Debug + 'static>(pub Session<Key>);
-
-    #[derive(Clone, Debug, Message)]
-    #[rtype(result = "()")]
-    pub struct RemoveSession<Key: Clone + Debug + 'static>(pub Key);
-
-    #[derive(Clone, Debug, Message)]
-    #[rtype(result = "()")]
-    pub struct AddConnectionToSession<Key: Clone + Debug + 'static>(pub Address, pub Key);
-
-    #[derive(Clone, Debug, Message)]
-    #[rtype(result = "()")]
     pub struct Shutdown;
 
     #[derive(Clone, Debug, Message)]
-    #[rtype(result = "Result<Vec<TriggerFut<Result<Address>>>>")]
-    pub struct Connect(pub Vec<Address>);
+    #[rtype(result = "Result<Vec<ConnectionFut<Key>>>")]
+    pub struct Connect<Key: Clone + Debug + 'static> {
+        pub addresses: Vec<Address>,
+        phantom: PhantomData<Key>,
+    }
+
+    impl<Key: Clone + Debug + 'static> Connect<Key> {
+        pub fn new(addresses: Vec<Address>) -> Self {
+            Connect {
+                addresses,
+                phantom: PhantomData,
+            }
+        }
+    }
 
     #[derive(Clone, Debug, Message)]
     #[rtype(result = "Result<()>")]

@@ -41,8 +41,8 @@ pub enum SessionError {
 pub enum DiscoveryError {
     #[error("timeout")]
     Timeout,
-    #[error("not found: {0}")]
-    NotFound(String),
+    #[error("not found")]
+    NotFound,
 }
 
 #[derive(thiserror::Error, Clone, Debug)]
@@ -61,8 +61,8 @@ pub enum MessageError {
     Signature(String),
     #[error("missing auth")]
     MissingAuth,
-    #[error("missing signature: {0}")]
-    MissingSignature(String),
+    #[error("missing signature")]
+    MissingSignature,
     #[error("unsupported signature")]
     UnsupportedSignature,
 }

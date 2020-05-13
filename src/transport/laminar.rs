@@ -65,7 +65,6 @@ impl ThreadControl {
 
     fn stop(self) {
         let _ = self.tx.send(());
-        self.arbiter.stop();
     }
 }
 
