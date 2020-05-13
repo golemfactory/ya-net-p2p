@@ -88,16 +88,41 @@ where
 unsafe impl<Key> Send for SessionCmd<Key> where Key: Send + Debug + Clone {}
 
 #[derive(Clone, Debug, Message)]
-#[rtype(result = "Result<Vec<Address>>")]
+#[rtype(result = "Result<DhtResponse>")]
 pub enum DhtCmd<Key>
 where
     Key: Send + Debug + Clone,
 {
-    Resolve(Key),
+    ResolveNode(Key),
+    ResolveValue(Vec<u8>),
+    PublishValue(Vec<u8>, Vec<u8>),
     // TODO: + node address change update
 }
 
 unsafe impl<Key> Send for DhtCmd<Key> where Key: Send + Debug + Clone {}
+
+#[derive(Clone, Debug, MessageResponse)]
+pub enum DhtResponse {
+    Addresses(Vec<Address>),
+    Value(Vec<u8>),
+    Empty,
+}
+
+impl DhtResponse {
+    pub fn into_addresses(self) -> Option<Vec<Address>> {
+        match self {
+            DhtResponse::Addresses(addrs) => Some(addrs),
+            _ => None,
+        }
+    }
+
+    pub fn into_value(self) -> Option<Vec<u8>> {
+        match self {
+            DhtResponse::Value(vec) => Some(vec),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Message)]
 #[rtype(result = "Result<Packet>")]

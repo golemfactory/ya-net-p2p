@@ -1,6 +1,6 @@
 use crate::common::FlattenResult;
 use crate::error::{DiscoveryError, Error, MessageError, ProtocolError};
-use crate::event::{DhtCmd, ProtocolCmd, SendCmd};
+use crate::event::{DhtCmd, DhtResponse, ProtocolCmd, SendCmd};
 use crate::packet::{Guarantees, Packet, Payload};
 use crate::protocol::ProtocolId;
 use crate::transport::Address;
@@ -89,7 +89,7 @@ where
     <N as ArrayLength<u8>>::ArrayType: Unpin,
     D: NodeDataExt + 'static,
 {
-    type Result = ActorResponse<Self, Vec<Address>, Error>;
+    type Result = ActorResponse<Self, DhtResponse, Error>;
 
     fn handle(&mut self, msg: DhtCmd<Key<N>>, _: &mut Context<Self>) -> Self::Result {
         let kad = match self.kad.addr() {
@@ -98,18 +98,57 @@ where
         };
 
         match msg {
-            DhtCmd::Resolve(key) => {
-                log::debug!("Resolving {}", key);
+            DhtCmd::ResolveNode(key) => {
+                log::debug!("Resolving node: {}", key);
 
                 let fut = async move {
                     let result = kad
-                        .send(KadEvtFindNode::new(key.clone(), 500000000.0))
+                        .send(KadFindNode::new(key.clone()))
                         .await??
-                        .ok_or(Error::from(DiscoveryError::Timeout(format!("[{}]", key))))?;
+                        .ok_or(Error::from(DiscoveryError::NotFound(key.to_string())))?;
 
                     let addresses = result.data.addresses();
-                    log::debug!("Resolved {}: {:?}", key, addresses);
-                    Ok(addresses)
+                    match addresses.is_empty() {
+                        true => Ok(DhtResponse::Empty),
+                        false => {
+                            log::debug!("Resolved node {}: {:?}", key, addresses);
+                            Ok(DhtResponse::Addresses(addresses))
+                        }
+                    }
+                };
+
+                ActorResponse::r#async(fut.into_actor(self))
+            }
+            DhtCmd::ResolveValue(key) => {
+                let hex_key = hex::encode(&key);
+                log::debug!("Resolving value: {}", hex_key);
+
+                let fut = async move {
+                    let (_, value) = kad
+                        .send(KadFindValue { key })
+                        .await??
+                        .ok_or(Error::from(DiscoveryError::NotFound(hex_key.clone())))?;
+
+                    log::debug!("Resolved value {}: {:?}", hex_key, value);
+                    Ok(DhtResponse::Value(value))
+                };
+
+                ActorResponse::r#async(fut.into_actor(self))
+            }
+            DhtCmd::PublishValue(key, value) => {
+                let hex_key = hex::encode(&key);
+                log::debug!("Publishing value: {}", hex_key);
+
+                let fut = async move {
+                    kad.send(KadStore {
+                        key,
+                        value,
+                        persistent: true,
+                    })
+                    .await??;
+
+                    log::debug!("Published value {}", hex_key);
+                    Ok(DhtResponse::Empty)
                 };
 
                 ActorResponse::r#async(fut.into_actor(self))
@@ -141,14 +180,13 @@ where
                         .signature()
                         .map(|sig| sig.key())
                         .flatten()
-                        .ok_or(MessageError::MissingSignature("KadEvt".into()))?;
+                        .ok_or(MessageError::MissingSignature("Kad message".into()))?;
 
-                    kad.send(KadEvtReceive {
+                    kad.send(KadReceive {
                         from: Node {
                             key: Key::<N>::try_from(key_vec)?,
                             data: D::from_address(address),
                         },
-                        new: false,
                         message: packet.payload.decode_payload()?,
                     })
                     .await??;
@@ -215,7 +253,7 @@ where
         };
 
         let fut = async move {
-            kad.send(KadEvtBootstrap {
+            kad.send(KadBootstrap {
                 nodes: cmd.nodes,
                 dormant: false,
             })

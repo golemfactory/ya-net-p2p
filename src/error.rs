@@ -39,8 +39,10 @@ pub enum SessionError {
 
 #[derive(thiserror::Error, Clone, Debug)]
 pub enum DiscoveryError {
-    #[error("timeout: {0}")]
-    Timeout(String),
+    #[error("timeout")]
+    Timeout,
+    #[error("not found: {0}")]
+    NotFound(String),
 }
 
 #[derive(thiserror::Error, Clone, Debug)]

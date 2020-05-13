@@ -1,5 +1,5 @@
 use crate::common::{FlattenResult, TriggerFut};
-use crate::error::{Error, NetworkError, SessionError};
+use crate::error::{DiscoveryError, Error, NetworkError, SessionError};
 use crate::event::*;
 use crate::packet::Packet;
 use crate::protocol::ProtocolId;
@@ -86,7 +86,7 @@ where
     fn session(
         &mut self,
         key: Key,
-        address: Addr<Self>,
+        actor: Addr<Self>,
     ) -> impl Future<Output = Result<Session<Key>>> {
         if let Some(session) = self.sessions.get(&key) {
             let cloned = session.clone();
@@ -105,14 +105,21 @@ where
         async move {
             let dht = dht.ok_or_else(|| Error::protocol("No discovery protocol"))?;
             let proto = proto.ok_or_else(|| Error::protocol("No session protocol"))?;
-            let addresses = dht.send(DhtCmd::Resolve(key.clone())).await??;
-            let conns = address.send(internal::Connect(addresses)).await??;
-            let (conn_address, _) = futures::future::select_ok(conns).await?;
-            address
-                .send(internal::AddConnectionToSession(conn_address, key))
+
+            let addresses = dht
+                .send(DhtCmd::ResolveNode(key.clone()))
+                .await??
+                .into_addresses()
+                .ok_or_else(|| DiscoveryError::Timeout)?;
+            let conns = actor.send(internal::Connect(addresses)).await??;
+            let address = futures::future::select_ok(conns).await?.0;
+
+            actor
+                .send(internal::AddConnectionToSession(address, key))
                 .await?;
             session.clone().await?;
-            proto.send(SessionCmd::Initiate(conn_address)).await??;
+            proto.send(SessionCmd::Initiate(address)).await??;
+
             Ok(session)
         }
         .right_future()

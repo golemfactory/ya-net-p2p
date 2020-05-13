@@ -209,8 +209,7 @@ mod test {
         let protocol_id = 12345 as ProtocolId;
         let mut payload = Payload::new(protocol_id)
             .with_relaying([1u8; 32].to_vec())
-            .with_payload([2u8; 29].to_vec())
-            .build();
+            .with_payload([2u8; 29].to_vec());
 
         payload.pilot_header.header_flags |= PilotHeader::FLAG_SIGNATURE;
         payload.signature = Some(Signature::ECDSA(SignatureECDSA::P256K1 {
