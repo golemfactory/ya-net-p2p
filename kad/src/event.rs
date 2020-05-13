@@ -14,25 +14,43 @@ pub struct KadEvtSend<N: KeyLen, D: NodeData> {
 
 #[derive(Clone, Debug, Message, Deserialize, Serialize)]
 #[rtype(result = "Result<()>")]
-pub struct KadEvtReceive<N: KeyLen, D: NodeData> {
+pub struct KadReceive<N: KeyLen, D: NodeData> {
     pub from: Node<N, D>,
-    pub new: bool,
     pub message: KadMessage,
 }
 
 #[derive(Clone, Debug, Message, Deserialize, Serialize)]
+#[rtype(result = "Result<()>")]
+pub struct KadBootstrap<N: KeyLen, D: NodeData> {
+    pub nodes: Vec<Node<N, D>>,
+    pub dormant: bool,
+}
+
+#[derive(Clone, Debug, Message, Deserialize, Serialize)]
+#[rtype(result = "Result<()>")]
+pub struct KadStore {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+    pub persistent: bool,
+}
+
+#[derive(Clone, Debug, Message)]
+#[rtype(result = "Result<()>")]
+pub struct KadNodeData<D: NodeData> {
+    pub data: D,
+}
+
+#[derive(Clone, Debug, Message, Deserialize, Serialize)]
 #[rtype(result = "Result<Option<Node<N, D>>>")]
-pub struct KadEvtFindNode<N: KeyLen + 'static, D: NodeData + 'static> {
+pub struct KadFindNode<N: KeyLen + 'static, D: NodeData + 'static> {
     pub key: Key<N>,
-    pub timeout: f64,
     phantom: PhantomData<D>,
 }
 
-impl<N: KeyLen + 'static, D: NodeData + 'static> KadEvtFindNode<N, D> {
-    pub fn new(key: Key<N>, timeout: f64) -> Self {
-        KadEvtFindNode {
+impl<N: KeyLen + 'static, D: NodeData + 'static> KadFindNode<N, D> {
+    pub fn new(key: Key<N>) -> Self {
+        KadFindNode {
             key,
-            timeout,
             phantom: PhantomData,
         }
     }
@@ -40,35 +58,30 @@ impl<N: KeyLen + 'static, D: NodeData + 'static> KadEvtFindNode<N, D> {
 
 #[derive(Clone, Debug, Message, Deserialize, Serialize)]
 #[rtype(result = "Result<Option<(Vec<u8>, Vec<u8>)>>")]
-pub struct KadEvtFindValue {
+pub struct KadFindValue {
     pub key: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Message, Deserialize, Serialize)]
+#[derive(Clone, Debug, Message)]
 #[rtype(result = "Result<()>")]
-pub struct KadEvtBootstrap<N: KeyLen, D: NodeData> {
+pub struct KadStoreForward<N: KeyLen, D: NodeData> {
+    pub key: Vec<u8>,
+    pub value: message::Value,
     pub nodes: Vec<Node<N, D>>,
-    pub dormant: bool,
 }
 
 #[derive(Clone, Debug, Message)]
 #[rtype(result = "Result<()>")]
-pub(crate) struct EvtRequest<N: KeyLen, D: NodeData> {
+pub(crate) struct KadRequestMessage<N: KeyLen, D: NodeData> {
     pub to: Node<N, D>,
     pub message: KadMessage,
 }
 
 #[derive(Clone, Debug, Message)]
 #[rtype(result = "Result<()>")]
-pub(crate) struct EvtRespond<N: KeyLen, D: NodeData> {
+pub(crate) struct KadResponseMessage<N: KeyLen, D: NodeData> {
     pub to: Node<N, D>,
     pub message: KadMessage,
-}
-
-#[derive(Clone, Debug, Message)]
-#[rtype(result = "Result<()>")]
-pub(crate) struct EvtNodeDataChanged<D: NodeData> {
-    pub data: D,
 }
 
 macro_rules! kad_message {

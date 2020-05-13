@@ -3,10 +3,13 @@ use futures::channel::mpsc;
 use futures::StreamExt;
 use rand::distributions::{Distribution, Uniform};
 use rand::Rng;
+use sha2::Digest;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::SocketAddr;
+use std::time::Duration;
 use structopt::StructOpt;
+use tokio::time::delay_for;
 use ya_net_kad::{event::*, Error, KadConfig};
 
 type Size = ya_net_kad::key_lengths::U32;
@@ -64,7 +67,7 @@ fn spawn_nodes(
     HashMap<Node, Addr<Kad>>,
     mpsc::Receiver<KadEvtSend<Size, Data>>,
 ) {
-    let (tx, rx) = mpsc::channel(size * MULTIPLIER);
+    let (tx, rx) = mpsc::channel(size * MULTIPLIER * 2);
     let mut nodes = gen_nodes(size + (size + 99) / 100 + 1)
         .into_iter()
         .collect::<Vec<_>>();
@@ -111,15 +114,12 @@ async fn bootstrap(
     boot: &HashMap<Node, Addr<Kad>>,
     nodes: &HashMap<Node, Addr<Kad>>,
 ) -> Result<(), Error> {
-    use std::time::Duration;
-    use tokio::time::delay_for;
-
     let init_vec = boot.iter().map(|(n, _)| n).cloned().collect::<Vec<_>>();
 
     for (node, addr) in boot.iter() {
         log::info!("Bootstrapping {}", node);
 
-        addr.send(KadEvtBootstrap {
+        addr.send(KadBootstrap {
             nodes: init_vec.clone(),
             dormant: true,
         })
@@ -129,7 +129,7 @@ async fn bootstrap(
     let mut futs = Vec::new();
 
     for (_, addr) in nodes.iter() {
-        futs.push(addr.send(KadEvtBootstrap {
+        futs.push(addr.send(KadBootstrap {
             nodes: init_vec.clone(),
             dormant: false,
         }));
@@ -139,32 +139,6 @@ async fn bootstrap(
 
     futures::future::join_all(futs).await;
     Ok(())
-}
-
-async fn find_node(nodes: &HashMap<Node, Addr<Kad>>) -> Result<Option<Node>, Error> {
-    let mut searcher;
-    let mut to_find;
-    let mut rng = rand::thread_rng();
-
-    loop {
-        let dist = Uniform::new(0, nodes.len());
-        let first_idx = dist.sample(&mut rng);
-        let second_idx = dist.sample(&mut rng);
-
-        searcher = nodes.iter().skip(first_idx).next().unwrap();
-        to_find = nodes.iter().skip(second_idx).next().unwrap();
-
-        if searcher != to_find {
-            break;
-        }
-    }
-
-    log::info!("Initiating node query [{} by {}", to_find.0.key, searcher.0);
-
-    searcher
-        .1
-        .send(KadEvtFindNode::new(to_find.0.key.clone(), 0f64))
-        .await?
 }
 
 async fn route(
@@ -178,9 +152,8 @@ async fn route(
         match nodes_ref.get(&to) {
             Some(addr) => {
                 let sent = addr
-                    .send(KadEvtReceive {
+                    .send(KadReceive {
                         from: from.clone(),
-                        new: false,
                         message,
                     })
                     .await;
@@ -195,9 +168,98 @@ async fn route(
     .await;
 }
 
+async fn find_node(nodes: &HashMap<Node, Addr<Kad>>) -> Result<Option<Node>, Error> {
+    let mut rng = rand::thread_rng();
+    let mut querying_node;
+    let mut node_to_find;
+
+    loop {
+        let dist = Uniform::new(0, nodes.len());
+        let first_idx = dist.sample(&mut rng);
+        let second_idx = dist.sample(&mut rng);
+
+        querying_node = nodes.iter().skip(first_idx).next().unwrap();
+        node_to_find = nodes.iter().skip(second_idx).next().unwrap();
+
+        if querying_node != node_to_find {
+            break;
+        }
+    }
+
+    let pause = Duration::from_secs(2);
+    log::info!("Pausing for {}s", pause.as_secs());
+    delay_for(pause).await;
+
+    log::info!(
+        "Initiating node query [{} by {}]",
+        node_to_find.0.key,
+        querying_node.0
+    );
+
+    let kad = querying_node.1;
+    let queried_key = node_to_find.0.key.clone();
+    kad.send(KadFindNode::new(queried_key)).await?
+}
+
+async fn find_value(nodes: &HashMap<Node, Addr<Kad>>) -> Result<Option<(Vec<u8>, Vec<u8>)>, Error> {
+    let mut querying_node;
+    let mut publishing_node;
+    let mut rng = rand::thread_rng();
+
+    loop {
+        let dist = Uniform::new(0, nodes.len());
+        let first_idx = dist.sample(&mut rng);
+        let second_idx = dist.sample(&mut rng);
+
+        querying_node = nodes.iter().skip(first_idx).next().unwrap();
+        publishing_node = nodes.iter().skip(second_idx).next().unwrap();
+
+        if querying_node != publishing_node {
+            break;
+        }
+    }
+
+    let store_data = format!("Data published by {}", publishing_node.0)
+        .as_bytes()
+        .to_vec();
+    let store_key = sha2::Sha256::digest(store_data.as_slice()).to_vec();
+
+    log::info!(
+        "Publishing value [{} by {}]",
+        hex::encode(&store_key),
+        publishing_node.0
+    );
+
+    let kad = publishing_node.1;
+    kad.send(KadStore {
+        key: store_key.clone(),
+        value: store_data,
+        persistent: false,
+    })
+    .await??;
+
+    let pause = Duration::from_secs(2);
+    log::info!("Pausing for {}s", pause.as_secs());
+    delay_for(pause).await;
+
+    let kad = querying_node.1;
+    kad.send(KadFindValue { key: store_key }).await?
+}
+
 #[derive(StructOpt)]
+#[structopt(rename_all = "kebab-case")]
+enum Action {
+    FindNode,
+    FindValue,
+}
+
+#[derive(StructOpt)]
+#[structopt(rename_all = "kebab-case")]
 struct Args {
     node_count: usize,
+    action_count: usize,
+    #[structopt(subcommand)]
+    action: Action,
 }
 
 #[actix_rt::main]
@@ -206,21 +268,39 @@ pub async fn main() -> anyhow::Result<()> {
     env::set_var(var, env::var(var).unwrap_or("debug".to_owned()));
     env_logger::init();
 
-    let count = Args::from_args().node_count;
-    let (boot, nodes, rx) = spawn_nodes(count);
+    let args = Args::from_args();
+    let node_count = std::cmp::max(3, args.node_count);
+    let (boot, nodes, rx) = spawn_nodes(node_count);
 
-    actix_rt::spawn(route(count * MULTIPLIER, nodes.clone(), rx));
+    actix_rt::spawn(route(node_count * MULTIPLIER, nodes.clone(), rx));
     bootstrap(&boot, &nodes).await?;
 
     log::warn!("Interrupt with ctrl + c");
 
-    loop {
-        match find_node(&nodes).await {
-            Ok(opt) => match opt {
-                Some(node) => log::info!("Node found: {}", node),
-                None => panic!("Node not found"),
+    let mut i: usize = 0;
+    while i < args.action_count {
+        match &args.action {
+            Action::FindNode => match find_node(&nodes).await {
+                Ok(opt) => match opt {
+                    Some(node) => log::info!("Node found: {}", node),
+                    None => panic!("Node not found"),
+                },
+                Err(e) => panic!(format!("Node lookup error: {:?}", e)),
             },
-            Err(e) => panic!(format!("Node lookup error: {:?}", e)),
+            Action::FindValue => match find_value(&nodes).await {
+                Ok(opt) => match opt {
+                    Some(entry) => {
+                        let key = hex::encode(&entry.0);
+                        let value = String::from_utf8(entry.1).unwrap();
+                        log::info!("Value found: {} = {}", key, value);
+                    }
+                    None => panic!("Value not found"),
+                },
+                Err(e) => panic!(format!("Value lookup error: {:?}", e)),
+            },
         }
+        i += 1;
     }
+
+    Ok(())
 }

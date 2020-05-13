@@ -1,4 +1,4 @@
-use crate::event::{EvtRequest, KadMessage};
+use crate::event::{KadMessage, KadRequestMessage};
 use crate::message;
 use crate::{Kad, Key, KeyLen, Node, NodeData, ALPHA};
 use actix::prelude::*;
@@ -13,6 +13,13 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::SeqCst;
 
+#[derive(Clone, Debug)]
+pub(crate) struct QueryConfig {
+    pub max_iterations: Option<u8>,
+    pub node_limit: usize,
+    pub req_ttl: i64,
+}
+
 pub(crate) struct Query<N, D>
 where
     N: KeyLen + Unpin + 'static,
@@ -20,11 +27,10 @@ where
     D: NodeData + 'static,
 {
     pub key: QueryKey,
+    conf: QueryConfig,
     kad: Addr<Kad<N, D>>,
-    node_limit: usize,
-    req_ttl: i64,
-    uid: usize,
     state: Rc<RefCell<QueryState<N, D>>>,
+    future_id: usize,
     future_state: Rc<RefCell<QueryFutureState>>,
 }
 
@@ -36,18 +42,16 @@ where
 {
     pub fn new(
         key: QueryKey,
+        conf: QueryConfig,
         nodes: Vec<Node<N, D>>,
         kad: Addr<Kad<N, D>>,
-        node_limit: usize,
-        req_ttl: i64,
     ) -> Self {
         let mut query = Query {
             key,
+            conf,
             kad,
-            node_limit,
-            req_ttl,
-            uid: usize::max_value(),
             state: Rc::new(RefCell::new(QueryState::default())),
+            future_id: usize::max_value(),
             future_state: Rc::new(RefCell::new(QueryFutureState::default())),
         };
 
@@ -68,8 +72,10 @@ where
 
         if let QueryState::InProgress {
             started_at: _,
+            iterations: _,
             pending,
             candidates,
+            closest,
             sent,
         } = &mut *self.state.borrow_mut()
         {
@@ -77,13 +83,21 @@ where
                 pending.remove(from);
             }
 
+            *closest = std::mem::replace(closest, Vec::new())
+                .into_iter()
+                .chain(nodes.iter().cloned())
+                .unique()
+                .sorted_by_key(|n| n.distance(&self.key))
+                .take(self.conf.node_limit)
+                .collect();
+
             *candidates = std::mem::replace(candidates, Vec::new())
                 .into_iter()
                 .chain(nodes.into_iter())
                 .filter(|n| !sent.contains(&n.key))
                 .unique()
                 .sorted_by_key(|n| n.distance(&self.key))
-                .take(self.node_limit)
+                .take(self.conf.node_limit)
                 .collect();
 
             iterate = pending.is_empty();
@@ -95,17 +109,21 @@ where
     }
 
     pub fn iterate(&mut self) {
-        let req_ttl = self.req_ttl;
+        let mut closest_nodes = None;
         let mut send_out_nodes = None;
 
         if let QueryState::InProgress {
             started_at,
+            iterations,
             pending,
             candidates,
+            closest,
             sent,
         } = &mut *self.state.borrow_mut()
         {
-            if Utc::now().timestamp() - *started_at > req_ttl {
+            *iterations += 1;
+
+            if Utc::now().timestamp() - *started_at > self.conf.req_ttl {
                 pending.clear();
             }
 
@@ -118,9 +136,23 @@ where
                 sent.extend(pending.clone());
                 send_out_nodes = Some(nodes)
             }
+
+            if let Some(max_iter) = &self.conf.max_iterations {
+                let at_max_iterations = *iterations == *max_iter as usize;
+                let at_empty_send_out = match &send_out_nodes {
+                    Some(nodes) => nodes.is_empty(),
+                    _ => false,
+                };
+
+                if at_max_iterations || at_empty_send_out {
+                    closest_nodes = Some(std::mem::replace(closest, Vec::new()));
+                }
+            }
         }
 
-        if let Some(nodes) = send_out_nodes {
+        if let Some(nodes) = closest_nodes {
+            self.finish(QueryValue::Neighbors(nodes));
+        } else if let Some(nodes) = send_out_nodes {
             match nodes.is_empty() {
                 true => self.finish(QueryValue::None),
                 false => self.send_out(nodes),
@@ -164,7 +196,7 @@ where
                     }),
                 };
 
-                if let Err(e) = address.send(EvtRequest { to, message }).await {
+                if let Err(e) = address.send(KadRequestMessage { to, message }).await {
                     log::error!("Unable to send query message: {:?}", e);
                 }
             }
@@ -180,15 +212,14 @@ where
 {
     fn clone(&self) -> Self {
         let state = self.future_state.borrow_mut();
-        let uid = state.seq.fetch_add(1, SeqCst);
+        let future_id = state.seq.fetch_add(1, SeqCst);
 
         Query {
-            uid,
             key: self.key.clone(),
+            conf: self.conf.clone(),
             kad: self.kad.clone(),
-            node_limit: self.node_limit,
-            req_ttl: self.req_ttl,
             state: self.state.clone(),
+            future_id,
             future_state: self.future_state.clone(),
         }
     }
@@ -202,7 +233,7 @@ where
 {
     fn drop(&mut self) {
         let mut fut_state = self.future_state.borrow_mut();
-        fut_state.waker_map.remove(&self.uid);
+        fut_state.waker_map.remove(&self.future_id);
     }
 }
 
@@ -221,7 +252,9 @@ where
         }
 
         let mut fut_state = self.future_state.borrow_mut();
-        fut_state.waker_map.insert(self.uid, cx.waker().clone());
+        fut_state
+            .waker_map
+            .insert(self.future_id, cx.waker().clone());
         Poll::Pending
     }
 }
@@ -230,8 +263,10 @@ where
 pub(crate) enum QueryState<N: KeyLen, D: NodeData> {
     InProgress {
         started_at: i64,
+        iterations: usize,
         pending: HashSet<Key<N>>,
         candidates: Vec<Node<N, D>>,
+        closest: Vec<Node<N, D>>,
         sent: HashSet<Key<N>>,
     },
     Finished {
@@ -243,8 +278,10 @@ impl<N: KeyLen, D: NodeData> Default for QueryState<N, D> {
     fn default() -> Self {
         QueryState::InProgress {
             started_at: Utc::now().timestamp(),
+            iterations: 0,
             pending: HashSet::new(),
             candidates: Vec::new(),
+            closest: Vec::new(),
             sent: HashSet::new(),
         }
     }
@@ -295,6 +332,7 @@ impl AsRef<[u8]> for QueryKey {
 #[derive(Clone, Debug)]
 pub(crate) enum QueryValue<N: KeyLen, D: NodeData> {
     Node(Node<N, D>),
+    Neighbors(Vec<Node<N, D>>),
     Value(Vec<u8>),
     None,
 }
