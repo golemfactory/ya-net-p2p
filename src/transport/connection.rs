@@ -21,11 +21,6 @@ lazy_static::lazy_static! {
 
 pub type ConnectionFut<Ctx> = TriggerFut<Result<Connection<Ctx>>>;
 
-pub trait ConnectionCtx<Key>: Clone + Debug {
-    fn key(&self) -> Key;
-    fn set_key(&mut self);
-}
-
 #[derive(Clone)]
 pub struct Connection<Ctx: Clone + Debug> {
     pub id: ConnectionId,

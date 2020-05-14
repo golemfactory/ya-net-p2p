@@ -53,6 +53,12 @@ where
             _ => false,
         }
     }
+
+    #[inline]
+    pub fn addresses(&self) -> Vec<Address> {
+        let connections = self.connections.lock().unwrap();
+        connections.keys().cloned().collect()
+    }
 }
 
 impl<Key> Session<Key>
@@ -128,11 +134,6 @@ where
         if established && now_empty {
             self.terminate();
         }
-    }
-
-    pub fn addresses(&self) -> Vec<Address> {
-        let connections = self.connections.lock().unwrap();
-        connections.keys().cloned().collect()
     }
 
     pub fn terminate(&mut self) {
