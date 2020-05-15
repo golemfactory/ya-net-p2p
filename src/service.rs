@@ -16,6 +16,11 @@ use std::iter::FromIterator;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use ya_client_model::NodeId;
+use ya_core_model::{identity, net};
+use ya_service_bus::{
+    connection, typed as bus, untyped as local_bus, Error, ResponseChunk, RpcEndpoint,
+};
 #[derive(Clone, Debug)]
 pub struct NetConfig {
     connection_timeout: Duration,

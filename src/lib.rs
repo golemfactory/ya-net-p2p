@@ -1,3 +1,4 @@
+#![allow(unused)]
 mod common;
 pub mod crypto;
 pub mod error;
@@ -7,6 +8,9 @@ pub mod protocol;
 mod serialize;
 mod session;
 pub mod transport;
+
+mod api;
+pub use api::*;
 
 #[cfg(feature = "mk1")]
 mod mk1;

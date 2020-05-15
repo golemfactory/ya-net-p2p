@@ -1,16 +1,7 @@
-use ya_core_model::{
-    ethaddr::{NodeId, ParseError},
-    net,
-};
+use crate::Error as NetApiError;
+use ya_client_model::node_id::{NodeId, ParseError};
+use ya_core_model::net;
 use ya_service_bus::typed as bus;
-
-#[derive(thiserror::Error, Debug)]
-pub enum NetApiError {
-    #[error("service bus address should have {} prefix: {0}", net::PUBLIC_PREFIX)]
-    PublicPrefixNeeded(String),
-    #[error("NodeId parse error: {0}")]
-    NodeIdParseError(#[from] ParseError),
-}
 
 pub trait TryRemoteEndpoint {
     fn try_service(&self, bus_addr: &str) -> Result<bus::Endpoint, NetApiError>;

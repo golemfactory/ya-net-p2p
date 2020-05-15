@@ -11,8 +11,8 @@ yagna = ["ya-core-model", "ya-service-api", "ya-service-api-interfaces", "ya-ser
 
 [dependencies]
 ya-net-kad = "0.1"
-
-ya-core-model = { version = "0.1", features = ["ethaddr", "net", "identity"], optional = true }
+ya-client-model = "0.1"
+ya-core-model = { version = "0.1", features = ["net", "identity"], optional = true }
 ya-service-api = { version = "0.1", optional = true }
 ya-service-api-interfaces = { version = "0.1", optional = true }
 ya-service-bus = { version = "0.2", optional = true }

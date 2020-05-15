@@ -128,7 +128,7 @@ pub mod ya_identity {
     use futures::future::LocalBoxFuture;
     use futures::FutureExt;
     use std::marker::PhantomData;
-    use ya_core_model::ethaddr::NodeId;
+    use ya_client_model::NodeId;
     use ya_core_model::identity;
     use ya_service_bus::{typed as bus, RpcEndpoint};
 

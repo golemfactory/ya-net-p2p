@@ -1,5 +1,6 @@
 use crate::protocol::ProtocolId;
 use crate::transport::{Address, TransportId};
+use ya_client_model::node_id::ParseError;
 
 #[derive(thiserror::Error, Clone, Debug)]
 pub enum NetworkError {
@@ -112,10 +113,19 @@ pub enum Error {
     #[error("service bus error: {0}")]
     ServiceBus(String),
 
-    #[error()]
-    #[cfg(feature = "mk1")]
-    #[error("{0}")]
-    Mk1(#[from] crate::mk1::NetApiError),
+    #[error(
+        "service bus address should have {} prefix: {0}",
+        ya_core_model::net::PUBLIC_PREFIX
+    )]
+    PublicPrefixNeeded(String),
+    #[error("NodeId parse error: {0}")]
+    NodeIdParseError(String),
+}
+
+impl From<ParseError> for Error {
+    fn from(e: ParseError) -> Self {
+        Error::NodeIdParseError(e.to_string())
+    }
 }
 
 impl Error {
