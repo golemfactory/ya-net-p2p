@@ -10,7 +10,7 @@ use std::convert::TryFrom;
 use std::env;
 use std::net::SocketAddr;
 use std::time::Duration;
-use ya_core_model::ethaddr::NodeId;
+use ya_client_model::NodeId;
 use ya_net::crypto::{Signature, SignatureECDSA};
 use ya_net::error::{CryptoError, MessageError};
 use ya_net::event::ServiceCmd;
