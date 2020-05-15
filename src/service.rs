@@ -494,7 +494,6 @@ where
         match evt {
             SessionEvt::Established(address, key) => match self.connections.get(&address) {
                 Some(conn) => {
-                    log::info!("Session connection with {:?} found", address);
                     self.sessions
                         .entry(key.clone())
                         .or_insert_with(|| Session::new(key))

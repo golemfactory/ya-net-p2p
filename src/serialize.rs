@@ -1,19 +1,32 @@
-mod message_pack {
+mod cbor {
     use crate::error::{Error, MessageError};
-    use rmp_serde::{decode, encode};
-    pub use rmp_serde::{from_read, to_vec};
+    use serde::de::DeserializeOwned;
+    use serde::Serialize;
+    use serde_cbor;
+    use std::io::Read;
 
-    impl From<encode::Error> for Error {
-        fn from(error: encode::Error) -> Self {
-            MessageError::Codec(format!("rmp encode error: {:?}", error)).into()
-        }
+    #[inline]
+    pub fn from_read<R, T>(rd: R) -> Result<T, Error>
+    where
+        R: Read,
+        T: DeserializeOwned,
+    {
+        serde_cbor::from_reader(rd).map_err(Error::from)
     }
 
-    impl From<decode::Error> for Error {
-        fn from(error: decode::Error) -> Self {
-            MessageError::Codec(format!("rmp decode error: {:?}", error)).into()
+    #[inline]
+    pub fn to_vec<T>(val: &T) -> Result<Vec<u8>, Error>
+    where
+        T: Serialize,
+    {
+        serde_cbor::to_vec(val).map_err(Error::from)
+    }
+
+    impl From<serde_cbor::Error> for Error {
+        fn from(error: serde_cbor::Error) -> Self {
+            MessageError::Codec(format!("cbor error: {:?}", error)).into()
         }
     }
 }
 
-pub use message_pack::*;
+pub use cbor::*;

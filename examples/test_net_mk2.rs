@@ -13,14 +13,16 @@ use std::time::Duration;
 use ya_core_model::ethaddr::NodeId;
 use ya_net::crypto::{Signature, SignatureECDSA};
 use ya_net::error::{CryptoError, MessageError};
-use ya_net::event::{ProtocolCmd, SendCmd, ServiceCmd};
-use ya_net::packet::{CryptoProcessor, Guarantees, Payload};
+use ya_net::event::ServiceCmd;
+use ya_net::packet::CryptoProcessor;
 use ya_net::protocol::kad::{KadBootstrapCmd, KadProtocol, NodeDataExt};
+use ya_net::protocol::rpc::{NetRpc, NetRpcError, NetRpcProtocol};
 use ya_net::protocol::session::SessionProtocol;
 use ya_net::transport::laminar::LaminarTransport;
 use ya_net::Result;
 use ya_net::*;
 use ya_net_kad::key_lengths::U64;
+use ya_service_bus::{RpcEnvelope, RpcMessage};
 
 type KeySize = U64;
 type Key = ya_net_kad::Key<KeySize>;
@@ -50,82 +52,15 @@ impl NodeDataExt for NodeDataExample {
     }
 }
 
-struct ProtocolExample {
-    net: Recipient<SendCmd<Key>>,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RpcMessageExample {
+    request: String,
 }
 
-impl ProtocolExample {
-    const PROTOCOL_ID: ProtocolId = 123;
-
-    fn new(net: Recipient<SendCmd<Key>>) -> Self {
-        ProtocolExample { net }
-    }
-}
-
-impl Actor for ProtocolExample {
-    type Context = Context<Self>;
-
-    fn started(&mut self, _: &mut Self::Context) {
-        log::info!("ExampleProtocol started");
-    }
-
-    fn stopped(&mut self, _: &mut Self::Context) {
-        log::info!("ExampleProtocol stopped");
-    }
-}
-
-impl Handler<ProtocolCmd<Key>> for ProtocolExample {
-    type Result = Result<()>;
-
-    fn handle(&mut self, msg: ProtocolCmd<Key>, ctx: &mut Context<Self>) -> Self::Result {
-        match msg {
-            ProtocolCmd::RoamingPacket(address, packet) => {
-                log::error!(
-                    "Received an unexpected roaming packet from {:?}: {:?}",
-                    address,
-                    packet
-                );
-            }
-            ProtocolCmd::SessionPacket(address, packet, key) => {
-                match packet.payload.decode_payload::<String>() {
-                    Ok(message) => log::info!(
-                        "SUCCESS: received a message from {:?} ({}): {}",
-                        address,
-                        key,
-                        message
-                    ),
-                    _ => log::error!("Invalid packet from {:?} ({}): {:?}", address, key, packet),
-                }
-            }
-            ProtocolCmd::Shutdown => ctx.stop(),
-        }
-        Ok(())
-    }
-}
-
-impl Handler<ProtocolMessage<Key>> for ProtocolExample {
-    type Result = ActorResponse<Self, (), Error>;
-
-    fn handle(&mut self, msg: ProtocolMessage<Key>, _: &mut Context<Self>) -> Self::Result {
-        let net = self.net.clone();
-        let fut = async move {
-            net.send(SendCmd::Session {
-                from: None,
-                to: msg.to,
-                packet: Packet {
-                    guarantees: Guarantees::unordered(),
-                    payload: Payload::new(Self::PROTOCOL_ID)
-                        .encode_payload(&msg.message)?
-                        .with_signature(),
-                },
-            })
-            .await??;
-
-            Ok(())
-        };
-
-        ActorResponse::r#async(fut.into_actor(self))
-    }
+impl RpcMessage for RpcMessageExample {
+    const ID: &'static str = "RpcMessageExample";
+    type Item = String;
+    type Error = String;
 }
 
 #[derive(Clone, Debug)]
@@ -240,7 +175,7 @@ async fn spawn_node<C: Crypto<Key> + 'static>(
 ) -> anyhow::Result<(
     Addr<Net<Key>>,
     Addr<KadProtocol<KeySize, NodeDataExample>>,
-    Addr<ProtocolExample>,
+    Addr<NetRpcProtocol<Key>>,
 )> {
     let socket_addrs = node
         .data
@@ -253,7 +188,7 @@ async fn spawn_node<C: Crypto<Key> + 'static>(
     let auth = CryptoProcessor::new(node.key.clone(), crypto).start();
     let kad = KadProtocol::new(node.clone(), net.clone().recipient()).start();
     let ses = SessionProtocol::new(net.clone().recipient(), net.clone().recipient()).start();
-    let exa = ProtocolExample::new(net.clone().recipient()).start();
+    let rpc = NetRpcProtocol::new(net.clone().recipient()).start();
     let lam = LaminarTransport::<Key>::new(net.clone().recipient()).start();
 
     log::debug!("Adding manglers... [{}]", node.key);
@@ -278,8 +213,8 @@ async fn spawn_node<C: Crypto<Key> + 'static>(
     ))
     .await??;
     net.send(ServiceCmd::AddProtocol(
-        ProtocolExample::PROTOCOL_ID,
-        exa.clone().recipient(),
+        NetRpcProtocol::<Key>::PROTOCOL_ID,
+        rpc.clone().recipient(),
     ))
     .await??;
 
@@ -291,7 +226,7 @@ async fn spawn_node<C: Crypto<Key> + 'static>(
     .await??;
 
     log::debug!("{} spawned", node);
-    Ok((net, kad, exa))
+    Ok((net, kad, rpc))
 }
 
 #[actix_rt::main]
@@ -356,18 +291,37 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let protocol_actions = permutations.iter_mut().map(|vec| {
-        let key = vec[1].0.key.clone();
-        let (node1, (_, _, exa1)) = &mut vec[0];
+        let from = vec[0].0.key.to_string();
+        let to = vec[1].0.key.clone();
+        let address = to.to_string();
+        let rpc2 = (vec[1]).1.clone().2;
+        let (node1, (_, _, rpc1)) = &mut vec[0];
 
-        exa1.send(ProtocolMessage {
-            to: key,
-            message: format!("Hello from {}", node1.key),
-        })
+        async move {
+            rpc2.bind_fn(&address, |msg: RpcEnvelope<RpcMessageExample>| {
+                async move { Ok(format!("Response to: {:?}", msg.into_inner().request)) }
+                    .boxed_local()
+            })
+            .await?;
+
+            let response = rpc1
+                .rpc(
+                    &address,
+                    from,
+                    to,
+                    RpcMessageExample {
+                        request: format!("Hello from {}", node1.key),
+                    },
+                    5.0,
+                )
+                .await?;
+
+            log::info!("Response: {:?}", response);
+            Ok::<_, NetRpcError>(())
+        }
     });
 
-    let results = futures::future::join_all(protocol_actions).await;
-    log::info!("Protocol send out results: {:?}", results);
-
+    futures::future::join_all(protocol_actions).await;
     actix_rt::signal::ctrl_c().await?;
 
     log::info!("Shutting down...");

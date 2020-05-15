@@ -27,8 +27,8 @@ hashbrown = "0.7"
 hex = "0.4.2"
 lazy_static = "1.4.0"
 log = "0.4"
-rmp-serde = {version = "=0.14.3" }
 serde = "1.0"
+serde_cbor = "0.11.1"
 sha2 = "0.8.1"
 thiserror = "1.0"
 tokio = { version = "0.2.18", features = ["time"] }

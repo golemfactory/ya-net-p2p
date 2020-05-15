@@ -14,12 +14,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub type ConnectionId = usize;
+pub type ConnectionFut<Ctx> = TriggerFut<Result<Connection<Ctx>>>;
 
 lazy_static::lazy_static! {
     static ref CONNECTION_ID_SEQ: AtomicUsize = AtomicUsize::new(0);
 }
-
-pub type ConnectionFut<Ctx> = TriggerFut<Result<Connection<Ctx>>>;
 
 #[derive(Clone)]
 pub struct Connection<Ctx: Clone + Debug> {
