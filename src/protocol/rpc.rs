@@ -6,7 +6,7 @@ use crate::protocol::ProtocolId;
 use crate::serialize::{from_read as deser, to_vec as ser};
 use actix::prelude::*;
 use futures::future::LocalBoxFuture;
-use futures::{FutureExt, TryFutureExt};
+use futures::FutureExt;
 use hashbrown::HashMap;
 use serde::export::PhantomData;
 use serde::{Deserialize, Serialize};
@@ -22,19 +22,11 @@ use ya_service_bus::{RpcEnvelope, RpcMessage};
 
 // Temporary convenience trait
 pub trait NetRpc<Key> {
-    fn bind<'f, M>(
-        &self,
-        endpoint: impl ToString,
-        recipient: Recipient<RpcEnvelope<M>>,
-    ) -> LocalBoxFuture<'f, Result<(), Error>>
+    fn bind<M>(&self, endpoint: impl ToString, recipient: Recipient<RpcEnvelope<M>>)
     where
         M: RpcMessage;
 
-    fn bind_fn<'f, M, F>(
-        &self,
-        endpoint: impl ToString,
-        f: F,
-    ) -> LocalBoxFuture<'f, Result<(), Error>>
+    fn bind_fn<M, F>(&self, endpoint: impl ToString, f: F)
     where
         M: RpcMessage,
         F: Fn(RpcEnvelope<M>) -> LocalBoxFuture<'static, Result<M::Item, M::Error>>
@@ -59,37 +51,25 @@ where
     Key: Hash + Eq + Clone + Debug + Unpin + Send + 'static,
 {
     #[inline]
-    fn bind<'f, M>(
-        &self,
-        endpoint: impl ToString,
-        recipient: Recipient<RpcEnvelope<M>>,
-    ) -> LocalBoxFuture<'f, Result<(), Error>>
+    fn bind<M>(&self, endpoint: impl ToString, recipient: Recipient<RpcEnvelope<M>>)
     where
         M: RpcMessage,
     {
-        self.send(Bind {
+        self.do_send(Bind {
             endpoint: endpoint.to_string(),
             recipient,
         })
-        .map_err(Error::from)
-        .boxed_local()
     }
 
     #[inline]
-    fn bind_fn<'f, M, F>(
-        &self,
-        endpoint: impl ToString,
-        f: F,
-    ) -> LocalBoxFuture<'f, Result<(), Error>>
+    fn bind_fn<M, F>(&self, endpoint: impl ToString, f: F)
     where
         M: RpcMessage,
         F: Fn(RpcEnvelope<M>) -> LocalBoxFuture<'static, Result<M::Item, M::Error>>
             + Send
             + 'static,
     {
-        self.send(BindFn::new(endpoint, f))
-            .map_err(Error::from)
-            .boxed_local()
+        self.do_send(BindFn::new(endpoint, f));
     }
 
     #[inline]
@@ -128,6 +108,7 @@ impl Default for ProtocolConfig {
         }
     }
 }
+
 pub struct NetRpcProtocol<Key>
 where
     Key: Hash + Eq + Clone + Debug + Unpin + Send + 'static,
@@ -135,8 +116,7 @@ where
     conf: ProtocolConfig,
     net: Recipient<SendCmd<Key>>,
     handlers: HashMap<String, Box<dyn NetRpcHandler>>,
-    requests: Ledger<TriggerFut<Vec<u8>>>,
-    responses: Ledger<TriggerFut<Vec<u8>>>,
+    requests: RequestMap<TriggerFut<Vec<u8>>>,
 }
 
 impl<Key> NetRpcProtocol<Key>
@@ -154,15 +134,13 @@ where
             conf,
             net,
             handlers: HashMap::new(),
-            requests: Ledger::default(),
-            responses: Ledger::default(),
+            requests: RequestMap::default(),
         }
     }
 
     fn upkeep(&mut self, _: &mut Context<Self>) {
         let now = Instant::now();
         self.requests.remove_elapsed(&now);
-        self.responses.remove_elapsed(&now);
     }
 }
 
@@ -170,21 +148,43 @@ impl<Key> NetRpcProtocol<Key>
 where
     Key: Hash + Eq + Clone + Debug + Unpin + Send + 'static,
 {
-    fn response_cmd(to: Key, request_id: usize, payload: Vec<u8>) -> Result<SendCmd<Key>, Error> {
-        let response = NetRpcMessage::Response {
-            request_id,
-            payload,
-        };
+    fn build_request<Id, M>(request_id: usize, msg: Rpc<Key, Id, M>) -> Result<SendCmd<Key>, Error>
+    where
+        M: RpcMessage,
+        Id: Clone + Debug + Send + ToString,
+    {
         let packet = Packet {
             guarantees: Guarantees::unordered(),
-            payload: Payload::new(Self::PROTOCOL_ID).encode_payload(&response)?,
+            payload: Payload::new(Self::PROTOCOL_ID).encode_payload(&NetRpcMessage::Request {
+                request_id,
+                endpoint: msg.endpoint,
+                payload: ser(&msg.message)?,
+                from: msg.from.to_string(),
+                timeout_secs: msg.timeout_secs,
+            })?,
         };
-        let cmd = SendCmd::Session {
+
+        Ok(SendCmd::Session {
+            from: None, // FIXME
+            to: msg.to,
+            packet,
+        })
+    }
+
+    fn build_response(to: Key, request_id: usize, payload: Vec<u8>) -> Result<SendCmd<Key>, Error> {
+        let packet = Packet {
+            guarantees: Guarantees::unordered(),
+            payload: Payload::new(Self::PROTOCOL_ID).encode_payload(&NetRpcMessage::Response {
+                request_id,
+                payload,
+            })?,
+        };
+
+        Ok(SendCmd::Session {
             from: None, // FIXME
             to,
             packet,
-        };
-        Ok(cmd)
+        })
     }
 }
 
@@ -240,7 +240,7 @@ where
                                     let response =
                                         timeout(duration, handle_fut).await.flatten_result();
                                     let payload = ser(&response)?;
-                                    let cmd = Self::response_cmd(key, request_id, payload)?;
+                                    let cmd = Self::build_response(key, request_id, payload)?;
 
                                     net.send(cmd).await??;
                                     Ok(())
@@ -248,9 +248,9 @@ where
                                 .left_future()
                             }
                             None => async move {
-                                let response = Err::<Vec<u8>, _>(NetRpcError::Endpoint);
+                                let response = Err::<Vec<u8>, _>(NetRpcError::UnknownEndpoint);
                                 let payload = ser(&response)?;
-                                let cmd = Self::response_cmd(key, request_id, payload)?;
+                                let cmd = Self::build_response(key, request_id, payload)?;
 
                                 net.send(cmd).await??;
                                 Ok(())
@@ -294,40 +294,22 @@ where
     type Result = ActorResponse<Self, M::Item, NetRpcError>;
 
     fn handle(&mut self, msg: Rpc<Key, Id, M>, _: &mut Context<Self>) -> Self::Result {
-        let seq = self.requests.next_seq();
-
-        let message = match ser(&msg.message) {
-            Ok(payload) => NetRpcMessage::Request {
-                request_id: seq,
-                endpoint: msg.endpoint,
-                payload,
-                from: msg.from.to_string(),
-                timeout_secs: msg.timeout_secs,
-            },
+        let request_id = self.requests.next_seq();
+        let duration = Duration::from_secs_f64(msg.timeout_secs);
+        let cmd = match Self::build_request(request_id, msg) {
+            Ok(cmd) => cmd,
             Err(err) => return ActorResponse::reply(Err(err.into())),
         };
-        let packet = match Payload::new(Self::PROTOCOL_ID).encode_payload(&message) {
-            Ok(payload) => Packet {
-                guarantees: Guarantees::unordered(),
-                payload,
-            },
-            Err(err) => return ActorResponse::reply(Err(Error::from(err).into())),
-        };
-        let send_cmd = SendCmd::Session {
-            from: None,
-            to: msg.to,
-            packet,
-        };
-
-        let duration = Duration::from_secs_f64(msg.timeout_secs);
-        let trigger = TriggerFut::<Vec<u8>>::default();
-        self.requests.insert(seq, trigger.clone(), duration);
 
         let net = self.net.clone();
-        let fut = async move {
-            net.send(send_cmd).await??;
-            let raw = timeout(duration, trigger).await?;
+        let trigger = self
+            .requests
+            .entry(request_id, TriggerFut::default(), duration)
+            .clone();
 
+        let fut = async move {
+            net.send(cmd).await??;
+            let raw = timeout(duration, trigger).await?;
             match deser::<_, Result<Vec<u8>, NetRpcError>>(raw.as_slice())? {
                 Ok(inner) => Ok(deser::<_, M::Item>(inner.as_slice())?),
                 Err(err) => Err(err),
@@ -392,7 +374,7 @@ impl TryFrom<Vec<u8>> for NetRpcMessage {
 pub enum NetRpcError {
     Service(String),
     Rpc(Vec<u8>),
-    Endpoint,
+    UnknownEndpoint,
     Timeout,
 }
 
@@ -548,45 +530,45 @@ where
 }
 
 #[derive(Debug)]
-struct Ledger<T> {
+struct RequestMap<T> {
     calls: HashMap<usize, T>,
-    active: HashMap<usize, Instant>,
-    call_seq: AtomicUsize,
+    deadlines: HashMap<usize, Instant>,
+    sequence: AtomicUsize,
 }
 
-impl<T> Default for Ledger<T> {
+impl<T> Default for RequestMap<T> {
     fn default() -> Self {
-        Ledger {
+        RequestMap {
             calls: HashMap::new(),
-            active: HashMap::new(),
-            call_seq: AtomicUsize::new(0),
+            deadlines: HashMap::new(),
+            sequence: AtomicUsize::new(0),
         }
     }
 }
 
-impl<T> Ledger<T> {
+impl<T> RequestMap<T> {
     #[inline]
     fn next_seq(&self) -> usize {
-        self.call_seq.fetch_add(1, SeqCst)
+        self.sequence.fetch_add(1, SeqCst)
     }
 
-    fn insert(&mut self, id: usize, value: T, duration: Duration) {
-        self.calls.insert(id, value);
-        self.active.insert(id, Instant::now() + duration);
+    fn entry(&mut self, id: usize, value: T, duration: Duration) -> &mut T {
+        self.deadlines.insert(id, Instant::now() + duration);
+        self.calls.entry(id).or_insert(value)
     }
 
     fn remove(&mut self, id: &usize) -> Option<T> {
-        self.active.remove(id);
+        self.deadlines.remove(id);
         self.calls.remove(id)
     }
 
     fn remove_elapsed(&mut self, now: &Instant) {
-        let mut active = std::mem::replace(&mut self.active, HashMap::new());
-        active
+        let mut deadlines = std::mem::replace(&mut self.deadlines, HashMap::new());
+        deadlines
             .drain_filter(|_, deadline| *deadline >= *now)
             .for_each(|(id, _)| {
                 self.remove(&id);
             });
-        std::mem::replace(&mut self.active, active);
+        std::mem::replace(&mut self.deadlines, deadlines);
     }
 }

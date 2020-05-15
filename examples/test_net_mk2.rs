@@ -299,10 +299,9 @@ async fn main() -> anyhow::Result<()> {
 
         async move {
             rpc2.bind_fn(&address, |msg: RpcEnvelope<RpcMessageExample>| {
-                async move { Ok(format!("Response to: {:?}", msg.into_inner().request)) }
+                async move { Ok(format!("Response to: {}", msg.into_inner().request)) }
                     .boxed_local()
-            })
-            .await?;
+            });
 
             let response = rpc1
                 .rpc(
@@ -316,7 +315,7 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?;
 
-            log::info!("Response: {:?}", response);
+            log::info!("SUCCESS: {:?}", response);
             Ok::<_, NetRpcError>(())
         }
     });
