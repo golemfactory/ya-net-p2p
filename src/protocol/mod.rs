@@ -1,6 +1,7 @@
 pub mod kad;
-// pub mod rpc;
 pub mod session;
-// mod stream;
+
+#[cfg(feature = "yagna")]
+pub mod rpc;
 
 pub type ProtocolId = u16;
