@@ -499,7 +499,7 @@ where
                     protocol.send(command).await??;
                     Ok(())
                 }
-                .map_err(|e: Error| log::error!("TransportEvent::Packet handler error: {}", e))
+                .map_err(|e: Error| log::error!("Packet handler error: {}", e))
                 .map(|_| ());
 
                 ctx.spawn(fut.into_actor(self));

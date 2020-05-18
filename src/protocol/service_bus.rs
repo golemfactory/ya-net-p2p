@@ -334,7 +334,6 @@ fn parse_addr(src: &String) -> Result<ParsedAddr, Error> {
         Err(Error::Service(format!("Invalid address: {}", src)))
     } else {
         let endpoint = format!("/public/{}", split[3]);
-        log::warn!("Parsing addr: {} as {} / {}", src, to, endpoint);
         Ok(ParsedAddr::Unicast(to.to_string(), endpoint))
     }
 }
