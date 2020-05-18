@@ -98,6 +98,7 @@ where
     ResolveNode(Key),
     ResolveValue(Vec<u8>),
     PublishValue(Vec<u8>, Vec<u8>),
+    Bootstrap(Vec<(Vec<u8>, Address)>),
     // TODO: + node address change update
 }
 

@@ -1,8 +1,8 @@
 use crate::common::FlattenResult;
-use crate::error::{DiscoveryError, Error, MessageError, ProtocolError};
+use crate::error::{DiscoveryError, Error, MessageError, NetworkError, ProtocolError};
 use crate::event::{DhtCmd, DhtResponse, ProtocolCmd, SendCmd};
 use crate::packet::{Guarantees, Packet, Payload};
-use crate::protocol::ProtocolId;
+use crate::protocol::{Protocol, ProtocolId};
 use crate::transport::Address;
 use crate::Result;
 use actix::prelude::*;
@@ -22,12 +22,6 @@ pub trait NodeDataExt: NodeData + Unpin + DeserializeOwned {
     fn addresses(&self) -> Vec<Address>;
 }
 
-#[derive(Clone, Debug, Message)]
-#[rtype(result = "Result<()>")]
-pub struct KadBootstrapCmd<N: KeyLen, D: NodeData> {
-    pub nodes: Vec<Node<N, D>>,
-}
-
 pub struct KadProtocol<N, D>
 where
     N: KeyLen + 'static,
@@ -38,22 +32,35 @@ where
     kad: KadState<N, D>,
 }
 
+impl<N, D> Protocol<Key<N>> for KadProtocol<N, D>
+where
+    N: KeyLen + 'static,
+    <N as ArrayLength<u8>>::ArrayType: Unpin,
+    D: NodeDataExt + 'static,
+{
+    const PROTOCOL_ID: ProtocolId = 1000;
+}
+
 impl<N, D> KadProtocol<N, D>
 where
     N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
     D: NodeDataExt + 'static,
 {
-    pub const PROTOCOL_ID: ProtocolId = 1000;
-
-    pub fn new(node: Node<N, D>, net: Recipient<SendCmd<Key<N>>>) -> Self {
+    pub fn new<R>(node: Node<N, D>, net: &R) -> Self
+    where
+        R: Into<Recipient<SendCmd<Key<N>>>> + Clone,
+    {
         Self::with_config(node, net, KadConfig::default())
     }
 
-    pub fn with_config(node: Node<N, D>, net: Recipient<SendCmd<Key<N>>>, conf: KadConfig) -> Self {
+    pub fn with_config<R>(node: Node<N, D>, net: &R, conf: KadConfig) -> Self
+    where
+        R: Into<Recipient<SendCmd<Key<N>>>> + Clone,
+    {
         KadProtocol {
             kad: KadState::new(node, conf),
-            net,
+            net: net.clone().into(),
         }
     }
 }
@@ -153,6 +160,39 @@ where
 
                 ActorResponse::r#async(fut.into_actor(self))
             }
+            DhtCmd::Bootstrap(nodes) => {
+                let kad = match self.kad.addr() {
+                    Ok(kad) => kad,
+                    Err(err) => return actor_reply(err),
+                };
+
+                let nodes = nodes
+                    .into_iter()
+                    .filter_map(|(key_vec, address)| {
+                        Some(Node {
+                            key: Key::try_from(key_vec).ok()?,
+                            data: D::from_address(address),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                if nodes.is_empty() {
+                    return actor_reply::<_, _, Error>(NetworkError::NoAddress.into());
+                }
+
+                let fut = async move {
+                    kad.send(KadBootstrap {
+                        nodes,
+                        dormant: false,
+                    })
+                    .await??;
+
+                    log::debug!("Bootstrap completed");
+                    Ok(DhtResponse::Empty)
+                };
+
+                ActorResponse::r#async(fut.into_actor(self))
+            }
         }
     }
 }
@@ -235,35 +275,6 @@ where
             }
         };
         ctx.spawn(fut.into_actor(self));
-    }
-}
-
-impl<N, D> Handler<KadBootstrapCmd<N, D>> for KadProtocol<N, D>
-where
-    N: KeyLen + Unpin + 'static,
-    <N as ArrayLength<u8>>::ArrayType: Unpin,
-    D: NodeDataExt + 'static,
-{
-    type Result = ActorResponse<Self, (), Error>;
-
-    fn handle(&mut self, cmd: KadBootstrapCmd<N, D>, _: &mut Context<Self>) -> Self::Result {
-        let kad = match self.kad.addr() {
-            Ok(kad) => kad,
-            Err(err) => return actor_reply(err),
-        };
-
-        let fut = async move {
-            kad.send(KadBootstrap {
-                nodes: cmd.nodes,
-                dormant: false,
-            })
-            .await??;
-
-            log::debug!("Bootstrap completed");
-            Ok(())
-        };
-
-        ActorResponse::r#async(fut.into_actor(self))
     }
 }
 

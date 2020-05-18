@@ -2,10 +2,10 @@ use crate::common::FlattenResult;
 use crate::error::{Error, NetworkError, SessionError};
 use crate::event::*;
 use crate::packet::Packet;
-use crate::protocol::ProtocolId;
+use crate::protocol::{Protocol, ProtocolId};
 use crate::session::Session;
 use crate::transport::connection::{ConnectionManager, PendingConnection};
-use crate::transport::{Address, TransportId};
+use crate::transport::{Address, Transport, TransportId};
 use crate::Result;
 use actix::prelude::*;
 use futures::{Future, FutureExt, StreamExt, TryFutureExt};
@@ -19,6 +19,31 @@ use std::time::Duration;
 use ya_client_model::NodeId;
 use ya_core_model::{identity, net};
 use ya_service_bus::{connection, typed as bus, untyped as local_bus, ResponseChunk, RpcEndpoint};
+
+pub trait NetAddrExt<Key>
+where
+    Key: Send + Debug + Clone,
+{
+    fn add_processor<A>(&self, actor: A) -> Recipient<ProcessCmd<Key>>
+    where
+        A: Actor<Context = Context<A>> + Handler<ProcessCmd<Key>>;
+
+    fn add_transport<A>(&self, actor: A) -> Recipient<TransportCmd>
+    where
+        A: Transport;
+
+    fn add_protocol<A>(&self, actor: A) -> Recipient<ProtocolCmd<Key>>
+    where
+        A: Protocol<Key>;
+
+    fn set_dht<A>(&self, actor: A) -> Recipient<DhtCmd<Key>>
+    where
+        A: Protocol<Key> + Handler<DhtCmd<Key>>;
+
+    fn set_session<A>(&self, actor: A) -> Recipient<SessionCmd<Key>>
+    where
+        A: Protocol<Key> + Handler<SessionCmd<Key>>;
+}
 
 #[derive(Clone, Debug)]
 pub struct NetConfig {
@@ -184,8 +209,6 @@ where
     type Context = Context<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        // TODO: service bus + handlers
-
         IntervalFunc::new(self.conf.upkeep_interval, Self::upkeep)
             .finish()
             .spawn(ctx);
@@ -223,6 +246,7 @@ where
                     actor
                         .send(internal::AddTransport(transport_id, recipient))
                         .await?;
+                    // TODO: update DHT addresses
                     Ok(())
                 };
                 ActorResponse::r#async(fut.into_actor(self))
@@ -242,6 +266,7 @@ where
                 let fut = async move {
                     recipient.send(TransportCmd::Shutdown).await??;
                     actor.send(internal::RemoveTransport(transport_id)).await?;
+                    // TODO: update DHT addresses
                     Ok(())
                 };
                 ActorResponse::r#async(fut.into_actor(self))
@@ -591,6 +616,70 @@ where
             }
             .into_actor(self),
         )
+    }
+}
+
+impl<Key> NetAddrExt<Key> for Addr<Net<Key>>
+where
+    Key: Unpin + Send + Clone + Debug + Hash + Eq + 'static,
+{
+    fn add_processor<A>(&self, actor: A) -> Recipient<ProcessCmd<Key>>
+    where
+        A: Actor<Context = Context<A>> + Handler<ProcessCmd<Key>>,
+    {
+        let recipient = actor.start().recipient();
+        self.do_send(ServiceCmd::AddProcessor(recipient.clone()));
+        recipient
+    }
+
+    fn add_transport<A>(&self, actor: A) -> Recipient<TransportCmd>
+    where
+        A: Transport,
+    {
+        {
+            let recipient = actor.start().recipient();
+            self.do_send(ServiceCmd::AddTransport(A::TRANSPORT_ID, recipient.clone()));
+            recipient
+        }
+    }
+
+    fn add_protocol<A>(&self, actor: A) -> Recipient<ProtocolCmd<Key>>
+    where
+        A: Protocol<Key>,
+    {
+        let recipient = actor.start().recipient();
+        self.do_send(ServiceCmd::AddProtocol(A::PROTOCOL_ID, recipient.clone()));
+        recipient
+    }
+
+    fn set_dht<A>(&self, actor: A) -> Recipient<DhtCmd<Key>>
+    where
+        A: Protocol<Key> + Handler<DhtCmd<Key>>,
+    {
+        {
+            let addr = actor.start();
+            self.do_send(ServiceCmd::SetDhtProtocol(addr.clone().recipient()));
+            self.do_send(ServiceCmd::AddProtocol(
+                A::PROTOCOL_ID,
+                addr.clone().recipient(),
+            ));
+            addr.recipient()
+        }
+    }
+
+    fn set_session<A>(&self, actor: A) -> Recipient<SessionCmd<Key>>
+    where
+        A: Protocol<Key> + Handler<SessionCmd<Key>>,
+    {
+        {
+            let addr = actor.start();
+            self.do_send(ServiceCmd::SetSessionProtocol(addr.clone().recipient()));
+            self.do_send(ServiceCmd::AddProtocol(
+                A::PROTOCOL_ID,
+                addr.clone().recipient(),
+            ));
+            addr.recipient()
+        }
     }
 }
 

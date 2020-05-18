@@ -52,6 +52,8 @@ pub enum ProtocolError {
     InvalidId(String),
     #[error("invalid protocol state: {0}")]
     InvalidState(String),
+    #[error("call error: {0}")]
+    Call(String),
 }
 
 #[derive(thiserror::Error, Clone, Debug)]
@@ -88,6 +90,9 @@ pub enum CryptoError {
 
 #[derive(thiserror::Error, Clone, Debug)]
 pub enum Error {
+    #[error("service error: {0}")]
+    Service(String),
+
     #[error("message error: {0}")]
     Message(#[from] MessageError),
     #[error("network error: {0}")]
@@ -108,10 +113,6 @@ pub enum Error {
     Identity(#[from] ya_core_model::identity::Error),
     #[error("signature error: {0}")]
     Signature(String),
-
-    #[cfg(feature = "yagna")]
-    #[error("service bus error: {0}")]
-    ServiceBus(String),
 
     #[error(
         "service bus address should have {} prefix: {0}",
@@ -147,13 +148,6 @@ impl Error {
 
     pub fn key_mismatch<A: AsRef<[u8]>, B: AsRef<[u8]>>(a: A, b: B) -> Self {
         SessionError::KeyMismatch(a.as_ref().to_vec(), b.as_ref().to_vec()).into()
-    }
-}
-
-#[cfg(feature = "yagna")]
-impl From<ya_service_bus::Error> for Error {
-    fn from(err: ya_service_bus::Error) -> Self {
-        Error::ServiceBus(err.to_string())
     }
 }
 

@@ -1,11 +1,17 @@
 pub mod connection;
 pub mod laminar;
 
+use crate::event::TransportCmd;
+use actix::{Actor, Context, Handler};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
 pub type TransportId = u16;
 pub type StreamId = u8;
+
+pub trait Transport: Actor<Context = Context<Self>> + Handler<TransportCmd> {
+    const TRANSPORT_ID: TransportId;
+}
 
 // FIXME: placeholder
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, Deserialize, Serialize)]

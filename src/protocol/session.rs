@@ -2,7 +2,8 @@ use crate::error::{Error, MessageError};
 use crate::event::{DisconnectReason, ProtocolCmd, SendCmd, SessionCmd, SessionEvt};
 use crate::packet::payload::Payload;
 use crate::packet::{Guarantees, Packet};
-use crate::{Address, ProtocolId};
+use crate::protocol::{Protocol, ProtocolId};
+use crate::transport::Address;
 use actix::prelude::*;
 use futures::FutureExt;
 use serde::{Deserialize, Serialize};
@@ -31,25 +32,35 @@ where
     events: Recipient<SessionEvt<Key>>,
 }
 
+impl<Key, E> Protocol<Key> for SessionProtocol<Key>
+where
+    Key: Send + Debug + Clone + Unpin + AsRef<[u8]> + TryFrom<Vec<u8>, Error = E> + 'static,
+    E: Into<Error> + 'static,
+{
+    const PROTOCOL_ID: ProtocolId = 0;
+}
+
 impl<Key> SessionProtocol<Key>
 where
     Key: Send + Debug + Clone + Unpin + 'static,
 {
-    pub const PROTOCOL_ID: ProtocolId = 0;
-
-    pub fn new(packets: Recipient<SendCmd<Key>>, events: Recipient<SessionEvt<Key>>) -> Self {
+    pub fn new<R, S>(packets: &R, events: &S) -> Self
+    where
+        R: Into<Recipient<SendCmd<Key>>> + Clone,
+        S: Into<Recipient<SessionEvt<Key>>> + Clone,
+    {
         Self::with_config(ProtocolConfig::default(), packets, events)
     }
 
-    pub fn with_config(
-        conf: ProtocolConfig,
-        packets: Recipient<SendCmd<Key>>,
-        events: Recipient<SessionEvt<Key>>,
-    ) -> Self {
+    pub fn with_config<R, S>(conf: ProtocolConfig, packets: &R, events: &S) -> Self
+    where
+        R: Into<Recipient<SendCmd<Key>>> + Clone,
+        S: Into<Recipient<SessionEvt<Key>>> + Clone,
+    {
         SessionProtocol {
             conf,
-            packets,
-            events,
+            packets: packets.clone().into(),
+            events: events.clone().into(),
         }
     }
 
@@ -96,7 +107,7 @@ where
 impl<Key, E> Handler<SessionCmd<Key>> for SessionProtocol<Key>
 where
     Key: Send + Debug + Clone + Unpin + AsRef<[u8]> + TryFrom<Vec<u8>, Error = E> + 'static,
-    E: Into<Error>,
+    E: Into<Error> + 'static,
 {
     type Result = ActorResponse<Self, (), Error>;
 

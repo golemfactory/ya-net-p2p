@@ -2,7 +2,7 @@ use crate::common::FlattenResult;
 use crate::error::*;
 use crate::event::*;
 use crate::packet::{AddressedPacket, DeliveryType, Guarantees, OrderingType, WirePacket};
-use crate::transport::Address;
+use crate::transport::{Address, Transport, TransportId};
 use crate::Result;
 use actix::prelude::*;
 use futures::channel::mpsc;
@@ -79,18 +79,31 @@ where
     phantom: PhantomData<Ctx>,
 }
 
+impl<Ctx> Transport for LaminarTransport<Ctx>
+where
+    Ctx: Unpin + Send + Clone + Debug + 'static,
+{
+    const TRANSPORT_ID: TransportId = Address::LAMINAR;
+}
+
 impl<Ctx> LaminarTransport<Ctx>
 where
     Ctx: Send + Clone + Debug,
 {
-    pub fn new(recipient: Recipient<TransportEvt>) -> Self {
+    pub fn new<R>(recipient: &R) -> Self
+    where
+        R: Into<Recipient<TransportEvt>> + Clone,
+    {
         Self::with_config(recipient, TransportConfig::default())
     }
 
-    pub fn with_config(recipient: Recipient<TransportEvt>, conf: TransportConfig) -> Self {
+    pub fn with_config<R>(recipient: &R, conf: TransportConfig) -> Self
+    where
+        R: Into<Recipient<TransportEvt>> + Clone,
+    {
         LaminarTransport {
             conf,
-            recipient,
+            recipient: recipient.clone().into(),
             thread_control: None,
             message_sender: None,
             phantom: PhantomData,
@@ -289,15 +302,18 @@ where
 
                     loop {
                         match thread_rx.try_recv() {
-                            Ok(Some(_)) | Err(_) => break,
+                            Ok(Some(_)) | Err(_) => {
+                                Arbiter::current().stop();
+                                break;
+                            }
                             _ => (),
                         }
 
                         socket.manual_poll(Instant::now());
 
                         while let Ok(Some(evt)) = evt_rx.try_next() {
-                            if let Err(e) = socket_sender.send(evt.into()).map_err(Error::from) {
-                                log::error!("Error sending packet: {}", e);
+                            if let Err(e) = socket_sender.send(evt.into()) {
+                                log::error!("Error sending packet: {}", Error::from(e));
                             }
                         }
 

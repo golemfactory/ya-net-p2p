@@ -3,30 +3,72 @@ use ethsign::{PublicKey, SecretKey};
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
 use hashbrown::HashMap;
-use itertools::Itertools;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 use std::env;
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::time::Duration;
+use structopt::StructOpt;
+use url::Url;
 use ya_client_model::NodeId;
 use ya_net::crypto::{Signature, SignatureECDSA};
 use ya_net::error::{CryptoError, MessageError};
-use ya_net::event::ServiceCmd;
+use ya_net::event::{DhtCmd, ServiceCmd};
 use ya_net::packet::CryptoProcessor;
-use ya_net::protocol::kad::{KadBootstrapCmd, KadProtocol, NodeDataExt};
-use ya_net::protocol::rpc::{NetRpc, NetRpcError, NetRpcProtocol};
+use ya_net::protocol::kad::{KadProtocol, NodeDataExt};
+use ya_net::protocol::service_bus::ServiceBusProtocol;
 use ya_net::protocol::session::SessionProtocol;
 use ya_net::transport::laminar::LaminarTransport;
-use ya_net::Result;
 use ya_net::*;
+use ya_net::{NetAddrExt, Result};
 use ya_net_kad::key_lengths::U64;
-use ya_service_bus::{RpcEnvelope, RpcMessage};
+use ya_service_bus::{actix_rpc, RpcEndpoint, RpcEnvelope, RpcMessage};
 
 type KeySize = U64;
 type Key = ya_net_kad::Key<KeySize>;
 type Node = ya_net_kad::Node<KeySize, NodeDataExample>;
+
+const SERVICE_ADDR: &'static str = "/public/example";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MessageExample {
+    message: String,
+}
+
+impl RpcMessage for MessageExample {
+    const ID: &'static str = "MessageExample";
+    type Item = MessageResponseExample;
+    type Error = String;
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MessageResponseExample {
+    reply: String,
+}
+
+struct ServiceExample;
+
+impl Actor for ServiceExample {
+    type Context = Context<Self>;
+
+    fn started(&mut self, ctx: &mut Self::Context) {
+        let addr = ctx.address();
+        actix_rpc::bind::<MessageExample>(SERVICE_ADDR, addr.recipient());
+    }
+}
+
+impl Handler<RpcEnvelope<MessageExample>> for ServiceExample {
+    type Result = ActorResponse<Self, MessageResponseExample, String>;
+
+    fn handle(&mut self, msg: RpcEnvelope<MessageExample>, _: &mut Context<Self>) -> Self::Result {
+        log::info!("Received an RPC message: {}", msg.message);
+        ActorResponse::reply(Ok(MessageResponseExample {
+            reply: format!("Reply to: {}", msg.message),
+        }))
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct NodeDataExample {
@@ -52,24 +94,13 @@ impl NodeDataExt for NodeDataExample {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct RpcMessageExample {
-    request: String,
-}
-
-impl RpcMessage for RpcMessageExample {
-    const ID: &'static str = "RpcMessageExample";
-    type Item = String;
-    type Error = String;
-}
-
 #[derive(Clone, Debug)]
 struct CryptoExample {
     identities: HashMap<NodeId, (SecretKey, PublicKey)>,
 }
 
 impl CryptoExample {
-    fn new_identity(&mut self) -> (NodeId, PublicKey) {
+    fn new_identity(&mut self) -> Vec<u8> {
         let bytes = rand::thread_rng().gen::<[u8; 32]>();
         let secret = SecretKey::from_raw(&bytes).unwrap();
         let public = secret.public();
@@ -78,7 +109,7 @@ impl CryptoExample {
         self.identities
             .insert(identity.clone(), (secret, public.clone()));
 
-        (identity, public)
+        public.bytes().to_vec()
     }
 }
 
@@ -162,175 +193,109 @@ impl Crypto<Key> for CryptoExample {
     }
 }
 
-#[derive(Clone, Debug, Message)]
-#[rtype(result = "Result<()>")]
-struct ProtocolMessage<To> {
-    to: To,
-    message: String,
+fn key_to_identity(key: &Key) -> anyhow::Result<NodeId> {
+    let public = match PublicKey::from_slice(key.as_ref()) {
+        Ok(public) => public,
+        Err(_) => return Err(anyhow::anyhow!("Invalid key")),
+    };
+    Ok(NodeId::from(public.address().as_ref()))
 }
 
-async fn spawn_node<C: Crypto<Key> + 'static>(
-    node: Node,
-    crypto: C,
-) -> anyhow::Result<(
-    Addr<Net<Key>>,
-    Addr<KadProtocol<KeySize, NodeDataExample>>,
-    Addr<NetRpcProtocol<Key>>,
-)> {
-    let socket_addrs = node
-        .data
-        .addresses()
-        .into_iter()
-        .map(|a| a.socket_addr)
-        .collect::<Vec<_>>();
-    let net = Net::new(socket_addrs).start();
-
-    let auth = CryptoProcessor::new(node.key.clone(), crypto).start();
-    let kad = KadProtocol::new(node.clone(), net.clone().recipient()).start();
-    let ses = SessionProtocol::new(net.clone().recipient(), net.clone().recipient()).start();
-    let rpc = NetRpcProtocol::new(net.clone().recipient()).start();
-    let lam = LaminarTransport::<Key>::new(net.clone().recipient()).start();
-
-    log::debug!("Adding manglers... [{}]", node.key);
-    net.send(ServiceCmd::AddProcessor(auth.clone().recipient()))
-        .await??;
-    log::debug!("Setting DHT protocol... [{}]", node.key);
-    net.send(ServiceCmd::SetDhtProtocol(kad.clone().recipient()))
-        .await??;
-    log::debug!("Adding session protocol... [{}]", node.key);
-    net.send(ServiceCmd::SetSessionProtocol(ses.clone().recipient()))
-        .await??;
-
-    log::debug!("Adding protocols... [{}]", node.key);
-    net.send(ServiceCmd::AddProtocol(
-        KadProtocol::<KeySize, NodeDataExample>::PROTOCOL_ID,
-        kad.clone().recipient(),
-    ))
-    .await??;
-    net.send(ServiceCmd::AddProtocol(
-        SessionProtocol::<Key>::PROTOCOL_ID,
-        ses.clone().recipient(),
-    ))
-    .await??;
-    net.send(ServiceCmd::AddProtocol(
-        NetRpcProtocol::<Key>::PROTOCOL_ID,
-        rpc.clone().recipient(),
-    ))
-    .await??;
-
-    log::debug!("Adding transport... [{}]", node.key);
-    net.send(ServiceCmd::AddTransport(
-        Address::LAMINAR,
-        lam.clone().recipient(),
-    ))
-    .await??;
-
-    log::debug!("{} spawned", node);
-    Ok((net, kad, rpc))
+#[derive(StructOpt)]
+struct Args {
+    /// Format: 127.0.0.1:11111
+    #[structopt(short, long)]
+    net_addr: String,
+    /// Format: tcp://127.0.0.1:22222
+    #[structopt(short, long)]
+    gsb_addr: Url,
+    /// Format: <key_hex>@127.0.0.1:33333
+    #[structopt(short, long)]
+    bootstrap: Option<String>,
+    /// Format: <node_id>
+    #[structopt(short, long)]
+    send_to: Option<String>,
 }
 
 #[actix_rt::main]
 async fn main() -> anyhow::Result<()> {
+    let args = Args::from_args();
+
     env::set_var(
         "RUST_LOG",
         env::var("RUST_LOG").unwrap_or("debug".to_string()),
     );
+    env::set_var("GSB_URL", args.gsb_addr.to_string());
     env_logger::init();
 
-    let node_count = 3 as usize;
     let mut crypto = CryptoExample::default();
 
-    log::info!("Spawning {} nodes", node_count);
+    log::info!("Starting router");
+    ya_sb_router::bind_gsb_router(Some(args.gsb_addr)).await?;
 
-    let nodes = (0..node_count)
-        .map(|idx| {
-            let socket_addr: SocketAddr = format!("127.0.0.1:{}", 2000 + idx).parse().unwrap();
-            Node {
-                key: Key::try_from(crypto.new_identity().1.bytes().to_vec()).unwrap(),
-                data: NodeDataExample::from_address(Address::new(Address::LAMINAR, socket_addr)),
-            }
-        })
-        .collect::<Vec<_>>();
+    log::info!("Starting example service");
+    ServiceExample {}.start();
 
-    let entries = futures::future::join_all(
-        nodes
-            .iter()
-            .cloned()
-            .map(|node| spawn_node(node, crypto.clone())),
-    )
-    .await
-    .into_iter()
-    .map(|r| r.unwrap())
-    .collect::<Vec<_>>();
+    log::info!("Spawning node");
+    let socket_addr: SocketAddr = args.net_addr.parse()?;
+    let socket_addrs = vec![socket_addr];
+    let node = Node {
+        key: Key::try_from(crypto.new_identity())?,
+        data: NodeDataExample::from_address(Address::new(Address::LAMINAR, socket_addr)),
+    };
+    let identity = key_to_identity(&node.key)?;
 
-    log::info!("Nodes spawned");
+    let net = Net::new(socket_addrs).start();
+    let dht = net.set_dht(KadProtocol::new(node.clone(), &net));
+    net.set_session(SessionProtocol::new(&net, &net));
+    net.add_processor(CryptoProcessor::new(node.key.clone(), crypto));
+    net.add_protocol(ServiceBusProtocol::new(&net, &dht));
+    net.add_transport(LaminarTransport::<Key>::new(&net));
 
-    let first_node = nodes.first().cloned().unwrap();
-
-    log::info!("Bootstrapping nodes");
-    futures::future::join_all(entries.iter().skip(1).map(|(_, kad, _)| {
-        kad.send(KadBootstrapCmd {
-            nodes: vec![first_node.clone()],
-        })
-    }))
-    .await;
+    log::info!("Node key: {}", hex::encode(&node.key));
+    log::info!("Node identity: {}", identity);
+    log::info!("Node addresses: {:?}", node.data.addresses());
 
     tokio::time::delay_for(Duration::from_secs(1)).await;
 
-    let other_nodes = nodes.iter().skip(1).cloned().collect::<Vec<_>>();
-    let other_entries = entries.iter().skip(1).cloned().collect::<Vec<_>>();
-    let mut permutations = other_nodes
-        .into_iter()
-        .zip(other_entries.into_iter())
-        .permutations(2)
-        .collect::<Vec<_>>();
+    if let Some(bootstrap) = args.bootstrap {
+        let split = bootstrap.split('@').collect::<Vec<_>>();
+        let key = hex::decode(&split[0])?;
+        let socket_addr: SocketAddr = split[1].parse()?;
+        let address = Address::new(Address::LAMINAR, socket_addr);
 
-    log::info!(
-        "Sending protocol commands for {} node permutations",
-        permutations.len()
-    );
+        log::info!("Bootstrapping node {} @ {:?}", split[0], address);
+        dht.send(DhtCmd::Bootstrap(vec![(key, address)])).await??;
+    }
 
-    let protocol_actions = permutations.iter_mut().map(|vec| {
-        let from = vec[0].0.key.to_string();
-        let to = vec[1].0.key.clone();
-        let address = to.to_string();
-        let rpc2 = (vec[1]).1.clone().2;
-        let (node1, (_, _, rpc1)) = &mut vec[0];
+    tokio::time::delay_for(Duration::from_secs(1)).await;
 
-        async move {
-            rpc2.bind_fn(&address, |msg: RpcEnvelope<RpcMessageExample>| {
-                async move { Ok(format!("Response to: {}", msg.into_inner().request)) }
-                    .boxed_local()
-            });
+    log::info!("Publishing identity information");
+    let _ = dht
+        .send(DhtCmd::PublishValue(
+            identity.as_ref().to_vec(),
+            node.key.to_vec(),
+        ))
+        .await?;
 
-            let response = rpc1
-                .rpc(
-                    &address,
-                    from,
-                    to,
-                    RpcMessageExample {
-                        request: format!("Hello from {}", node1.key),
-                    },
-                    5.0,
-                )
-                .await?;
+    tokio::time::delay_for(Duration::from_secs(1)).await;
 
-            log::info!("SUCCESS: {:?}", response);
-            Ok::<_, NetRpcError>(())
-        }
-    });
+    if let Some(send_to) = args.send_to {
+        log::info!("Sending a message via GSB");
 
-    futures::future::join_all(protocol_actions).await;
+        let response = NodeId::from_str(send_to.as_str())?
+            .try_service(SERVICE_ADDR)?
+            .send(MessageExample {
+                message: format!("request from {}", identity),
+            })
+            .await?;
+
+        log::info!("Received response: {:?}", response);
+    }
+
     actix_rt::signal::ctrl_c().await?;
 
     log::info!("Shutting down...");
-    futures::future::join_all(
-        entries
-            .iter()
-            .map(|(net, _, _)| net.send(ServiceCmd::Shutdown)),
-    )
-    .await;
-
-    log::info!("done.");
+    net.send(ServiceCmd::Shutdown).await??;
     Ok(())
 }
