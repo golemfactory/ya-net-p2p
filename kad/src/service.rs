@@ -273,7 +273,12 @@ where
             }
             nodes.insert(0, self.node.clone());
         } else if nodes.len() < self.table.bucket_size {
-            nodes.insert(0, self.node.clone());
+            if match excluded {
+                Some(ex) => ex != &self.node.key,
+                None => true,
+            } {
+                nodes.push(self.node.clone());
+            }
         }
         nodes
     }
@@ -426,7 +431,7 @@ where
         };
 
         let actor = ctx.address();
-        let nodes = self.find_node(&as_node_key, None);
+        let nodes = self.find_node(&as_node_key, Some(&self.node.key));
         let query = self.initiate_query(
             QueryKey::Node(as_node_key.to_vec()),
             nodes,
@@ -799,7 +804,7 @@ where
             Err(error) => return ActorResponse::reply(Err(error)),
         };
 
-        let nodes = self.find_node(&as_node_key, None);
+        let nodes = self.find_node(&as_node_key, Some(&self.node.key));
         let query = self.initiate_query(query_key, nodes, None, ctx.address());
         let fut = async move {
             match query.await {
