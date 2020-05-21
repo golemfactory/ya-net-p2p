@@ -28,5 +28,21 @@ hex = "0.4.2"
 git = "https://github.com/mfranciszkiewicz/laminar"
 branch = "feature/ack-frags"
 
+[dev-dependencies]
+rand="0.7.3"
+structopt = "0.3"
+url="2.1.1"
+anyhow="1.0"
+actix-rt = "1.0"
+ya-service-bus = "0.2"
+ya-sb-router = "0.1"
+env_logger = "0.7.1"
+
 [workspace]
 members = ['kad']
+
+[patch.crates-io]
+ya-sb-util = { git = "https://github.com/golemfactory/yagna.git", rev = "4019c639db62d99d261120faa9dde7ff9415dd57" }
+ya-sb-proto = { git = "https://github.com/golemfactory/yagna.git", rev = "4019c639db62d99d261120faa9dde7ff9415dd57" }
+ya-service-bus = { git = "https://github.com/golemfactory/yagna.git", rev = "4019c639db62d99d261120faa9dde7ff9415dd57" }
+ya-sb-router = { git = "https://github.com/golemfactory/yagna.git", rev = "4019c639db62d99d261120faa9dde7ff9415dd57" }

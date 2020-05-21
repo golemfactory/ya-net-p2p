@@ -4,9 +4,6 @@ use actix::{Actor, Context, Handler};
 pub mod kad;
 pub mod session;
 
-#[cfg(feature = "yagna")]
-pub mod service_bus;
-
 pub type ProtocolId = u16;
 
 pub trait Protocol<Key>: Actor<Context = Context<Self>> + Handler<ProtocolCmd<Key>>

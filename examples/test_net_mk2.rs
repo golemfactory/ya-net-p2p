@@ -8,22 +8,21 @@ use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 use std::env;
 use std::net::SocketAddr;
-use std::str::FromStr;
+
 use std::time::Duration;
 use structopt::StructOpt;
 use url::Url;
 use ya_client_model::NodeId;
-use ya_net::crypto::{Signature, SignatureECDSA};
-use ya_net::error::{CryptoError, MessageError};
-use ya_net::event::{DhtCmd, ServiceCmd};
-use ya_net::packet::CryptoProcessor;
-use ya_net::protocol::kad::{KadProtocol, NodeDataExt};
-use ya_net::protocol::service_bus::ServiceBusProtocol;
-use ya_net::protocol::session::SessionProtocol;
-use ya_net::transport::laminar::LaminarTransport;
-use ya_net::*;
-use ya_net::{NetAddrExt, Result};
 use ya_net_kad::key_lengths::U64;
+use ya_net_p2p::crypto::{Signature, SignatureECDSA};
+use ya_net_p2p::error::{CryptoError, MessageError};
+use ya_net_p2p::event::{DhtCmd, ServiceCmd};
+use ya_net_p2p::packet::CryptoProcessor;
+use ya_net_p2p::protocol::kad::{KadProtocol, NodeDataExt};
+use ya_net_p2p::protocol::session::SessionProtocol;
+use ya_net_p2p::transport::laminar::LaminarTransport;
+use ya_net_p2p::*;
+use ya_net_p2p::{NetAddrExt, Result};
 use ya_service_bus::{actix_rpc, RpcEndpoint, RpcEnvelope, RpcMessage};
 
 type KeySize = U64;
@@ -249,7 +248,7 @@ async fn main() -> anyhow::Result<()> {
     let dht = net.set_dht(KadProtocol::new(node.clone(), &net));
     net.set_session(SessionProtocol::new(&net, &net));
     net.add_processor(CryptoProcessor::new(node.key.clone(), crypto));
-    net.add_protocol(ServiceBusProtocol::new(&net, &dht));
+    //net.add_protocol(ServiceBusProtocol::new(&net, &dht));
     net.add_transport(LaminarTransport::<Key>::new(&net));
 
     log::info!("Node key: {}", hex::encode(&node.key));
@@ -280,6 +279,7 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::time::delay_for(Duration::from_secs(1)).await;
 
+    /* TODO: fix this
     if let Some(send_to) = args.send_to {
         log::info!("Sending a message via GSB");
 
@@ -292,6 +292,7 @@ async fn main() -> anyhow::Result<()> {
 
         log::info!("Received response: {:?}", response);
     }
+    */
 
     actix_rt::signal::ctrl_c().await?;
 
