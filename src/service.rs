@@ -16,8 +16,6 @@ use std::iter::FromIterator;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use ya_client_model::NodeId;
-
 pub trait NetAddrExt<Key>
 where
     Key: Send + Debug + Clone,

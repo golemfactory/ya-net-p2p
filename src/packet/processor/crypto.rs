@@ -59,7 +59,7 @@ where
                 if packet.payload.is_signed() {
                     let data = packet.payload.signature_data();
                     let hash = sha2::Sha256::digest(&data).to_vec();
-                    sign_fut = Some(self.crypto.sign(key, hash));
+                    sign_fut = Some(self.crypto.sign(&key, hash));
                 }
 
                 let fut = async move {
@@ -85,7 +85,7 @@ where
                     };
 
                     let digest = sha2::Sha256::digest(&data);
-                    match self.crypto.verify(from, sig, digest.as_ref()) {
+                    match self.crypto.verify(from.as_ref(), sig, digest.as_ref()) {
                         Ok(false) => return actor_reply(Error::sig("crypto: invalid signature")),
                         Err(err) => return actor_reply(err),
                         _ => (),
