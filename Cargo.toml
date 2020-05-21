@@ -1,52 +1,32 @@
 [package]
-name = "ya-net"
-version = "0.1.1"
+name = "ya-net-p2p"
+version = "0.1.0"
 authors = ["Golem Factory <contact@golem.network>"]
 edition = "2018"
 
 [features]
-default = ["yagna"]
-mk1=["yagna"]
-yagna = ["ya-core-model", "ya-service-api", "ya-service-api-interfaces", "ya-service-bus"]
 
 [dependencies]
-ya-net-kad = "0.1"
-ya-client-model = "0.1"
-ya-core-model = { version = "0.1", features = ["net", "identity"], optional = true }
-ya-service-api = { version = "0.1", optional = true }
-ya-service-api-interfaces = { version = "0.1", optional = true }
-ya-service-bus = { version = "0.2", optional = true }
-
+ya-net-kad = { version = "0.1", path = "kad" }
+ya-client-model = { version = "0.1", git = "https://github.com/golemfactory/ya-client.git", rev = "baf7d33ad728b485dba555f65f517c433ffa435a" }
 actix = "0.9"
-anyhow = "1.0"
+tokio-bytes = { version = "0.5", package = "bytes" }
+tokio = { version = "0.2", features=["time"]}
+futures="0.3"
+sha2 = "0.8.1"
+serde = "1.0"
+hashbrown = "0.7"
+generic-array = "0.13.2"
+serde_cbor = "0.11.1"
+thiserror = "1.0"
+log = "0.4"
 ethsign = "0.7.3"
 crossbeam-channel = "0.3.9"
-futures = "0.3"
-generic-array = "0.13.2"
-hashbrown = "0.7"
 hex = "0.4.2"
-lazy_static = "1.4.0"
-log = "0.4"
-serde = "1.0"
-serde_cbor = "0.11.1"
-sha2 = "0.8.1"
-thiserror = "1.0"
-tokio = { version = "0.2.18", features = ["time"] }
-tokio-bytes = { version = "0.5", package = "bytes" }
 
 [dependencies.laminar]
 git = "https://github.com/mfranciszkiewicz/laminar"
 branch = "feature/ack-frags"
 
-[[example]]
-name="test_net_mk1"
-required-features = ["mk1"]
-
-[dev-dependencies]
-actix-rt = "1.0"
-env_logger = "0.7"
-itertools = "0.9.0"
-rand = "0.7.3"
-structopt = "0.3"
-ya-sb-router = "0.1"
-url = "2.1.1"
+[workspace]
+members = ['kad']

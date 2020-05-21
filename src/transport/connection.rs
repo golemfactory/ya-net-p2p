@@ -16,12 +16,10 @@ use std::time::{Duration, Instant};
 pub type ConnectionId = usize;
 pub type ConnectionFut<Ctx> = TriggerFut<Result<Connection<Ctx>>>;
 
-lazy_static::lazy_static! {
-    static ref CONNECTION_ID_SEQ: AtomicUsize = AtomicUsize::new(0);
-}
+static CONNECTION_ID_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
-pub struct Connection<Ctx: Clone + Debug> {
+pub struct Connection<Ctx> {
     pub id: ConnectionId,
     pub address: Address,
     pub created: Instant,
@@ -29,10 +27,10 @@ pub struct Connection<Ctx: Clone + Debug> {
     ctx: Arc<Mutex<Option<Ctx>>>,
 }
 
-impl<Ctx: Clone + Debug> Connection<Ctx> {
+impl<Ctx: Clone> Connection<Ctx> {
     pub fn new(address: Address, channel: Sender<AddressedPacket>) -> Self {
         Connection {
-            id: (*CONNECTION_ID_SEQ).fetch_add(1, SeqCst),
+            id: CONNECTION_ID_SEQ.fetch_add(1, SeqCst),
             address,
             created: Instant::now(),
             channel,
@@ -69,13 +67,13 @@ impl<Ctx: Clone + Debug> Connection<Ctx> {
     }
 }
 
-impl<Ctx: Clone + Debug> Hash for Connection<Ctx> {
+impl<Ctx> Hash for Connection<Ctx> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.address.hash(state)
     }
 }
 
-impl<Ctx: Clone + Debug> PartialEq for Connection<Ctx> {
+impl<Ctx> PartialEq for Connection<Ctx> {
     fn eq(&self, other: &Self) -> bool {
         self.address == other.address
     }

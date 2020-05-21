@@ -1,5 +1,6 @@
 use crate::protocol::ProtocolId;
 use crate::transport::{Address, TransportId};
+use std::sync::Arc;
 use ya_client_model::node_id::ParseError;
 
 #[derive(thiserror::Error, Clone, Debug)]
@@ -92,7 +93,6 @@ pub enum CryptoError {
 pub enum Error {
     #[error("service error: {0}")]
     Service(String),
-
     #[error("message error: {0}")]
     Message(#[from] MessageError),
     #[error("network error: {0}")]
@@ -103,29 +103,19 @@ pub enum Error {
     Session(#[from] SessionError),
     #[error("discovery error: {0}")]
     Discovery(#[from] DiscoveryError),
-
+    #[error("sign: {0}")]
+    Sign(#[from] Arc<ethsign::Error>),
     #[error("channel error: {0}")]
     Channel(#[from] ChannelError),
-
     #[error("crypto error: {0}")]
     Crypto(#[from] CryptoError),
-    #[error("identity error: {0}")]
-    Identity(#[from] ya_core_model::identity::Error),
     #[error("signature error: {0}")]
     Signature(String),
-
-    #[error(
-        "service bus address should have {} prefix: {0}",
-        ya_core_model::net::PUBLIC_PREFIX
-    )]
-    PublicPrefixNeeded(String),
-    #[error("NodeId parse error: {0}")]
-    NodeIdParseError(String),
 }
 
-impl From<ParseError> for Error {
-    fn from(e: ParseError) -> Self {
-        Error::NodeIdParseError(e.to_string())
+impl From<ethsign::Error> for Error {
+    fn from(e: ethsign::Error) -> Self {
+        Error::Sign(e.into())
     }
 }
 

@@ -22,13 +22,13 @@ impl<T, E, Ex: Into<E>> FlattenResult<T, E> for Result<Result<T, E>, Ex> {
     }
 }
 
-pub struct TriggerFut<T: Clone> {
+pub struct TriggerFut<T> {
     pub created_at: Instant,
     future_state: Arc<Mutex<FutureState<T>>>,
     future_id: usize,
 }
 
-impl<T: Clone> TriggerFut<T> {
+impl<T> TriggerFut<T> {
     pub fn is_pending(&self) -> bool {
         (*self.future_state.lock().unwrap()).value.is_none()
     }
@@ -40,7 +40,7 @@ impl<T: Clone> TriggerFut<T> {
     }
 }
 
-impl<T: Clone> Default for TriggerFut<T> {
+impl<T> Default for TriggerFut<T> {
     fn default() -> Self {
         TriggerFut {
             created_at: Instant::now(),
@@ -66,7 +66,7 @@ impl<T: Clone> Clone for TriggerFut<T> {
     }
 }
 
-impl<T: Clone> Drop for TriggerFut<T> {
+impl<T> Drop for TriggerFut<T> {
     fn drop(&mut self) {
         let mut future_state = self.future_state.lock().unwrap();
         future_state.remove(&self.future_id);

@@ -9,17 +9,7 @@ mod serialize;
 mod session;
 pub mod transport;
 
-mod api;
-pub use api::*;
-
-#[cfg(feature = "mk1")]
-mod mk1;
-#[cfg(not(feature = "mk1"))]
 mod service;
-
-#[cfg(feature = "mk1")]
-pub use mk1::*;
-#[cfg(not(feature = "mk1"))]
 pub use service::*;
 
 pub use crypto::Crypto;
