@@ -7,7 +7,7 @@ use crate::serialize::{from_read as deser, to_vec as ser};
 use crate::transport::Address;
 use actix::prelude::*;
 use futures::future::LocalBoxFuture;
-use futures::{FutureExt, TryFutureExt};
+use futures::{FutureExt, StreamExt, TryFutureExt};
 use hashbrown::HashMap;
 use serde::de::DeserializeOwned;
 use serde::export::PhantomData;
@@ -135,6 +135,42 @@ where
             packet,
         })
     }
+
+    fn handle_rpc_message<'a>(
+        &mut self,
+        key: Key,
+        msg: NetRpcMessage,
+    ) -> LocalBoxFuture<'a, Result<(), Error>> {
+        match msg {
+            NetRpcMessage::Request {
+                request_id,
+                caller,
+                callee: _,
+                addr,
+                body,
+            } => {
+                let net = self.net.clone();
+                async move {
+                    let response = router_send(addr.as_str(), caller.as_str(), body.as_slice())
+                        .map_err(|e| e.to_string())
+                        .await;
+
+                    let payload = ser(&response)?;
+                    net.send(Self::build_response(key, request_id, payload)?)
+                        .await??;
+                    Ok(())
+                }
+                .boxed_local()
+            }
+            NetRpcMessage::Response { request_id, body } => {
+                match self.requests.remove(&request_id) {
+                    Some(mut request) => request.ready(Ok(body)),
+                    None => log::warn!("Unknown request id: {}", request_id),
+                }
+                futures::future::ok(()).boxed_local()
+            }
+        }
+    }
 }
 
 impl<Key> Actor for ServiceBusProtocol<Key>
@@ -178,40 +214,8 @@ where
                     Ok(msg) => msg,
                     Err(err) => return ActorResponse::reply(Err(err.into())),
                 };
-
-                match msg {
-                    NetRpcMessage::Request {
-                        request_id,
-                        caller,
-                        callee: _,
-                        addr,
-                        body,
-                    } => {
-                        let net = self.net.clone();
-                        let fut = async move {
-                            let response =
-                                router_send(addr.as_str(), caller.as_str(), body.as_slice())
-                                    .map_err(|e| e.to_string())
-                                    .await;
-
-                            let payload = ser(&response)?;
-                            net.send(Self::build_response(key, request_id, payload)?)
-                                .await??;
-                            Ok(())
-                        };
-
-                        ActorResponse::r#async(fut.into_actor(self))
-                    }
-                    NetRpcMessage::Response { request_id, body } => {
-                        match self.requests.remove(&request_id) {
-                            Some(mut request) => request.ready(Ok(body)),
-                            None => log::warn!("Unknown request id: {}", request_id),
-                        }
-
-                        ActorResponse::reply(Ok(()))
-                    }
-                    NetRpcMessage::Broadcast { body: _ } => unimplemented!(),
-                }
+                let fut = self.handle_rpc_message(key, msg);
+                ActorResponse::r#async(fut.into_actor(self))
             }
             ProtocolCmd::RoamingPacket(_, _) => {
                 let err = SessionError::Disconnected;
@@ -238,6 +242,7 @@ where
             Err(err) => return ActorResponse::reply(Err(err.into())),
         };
 
+        let net = self.net.clone();
         let trigger = self
             .requests
             .entry(request_id)
@@ -245,7 +250,6 @@ where
             .clone();
         let mut trigger_err = trigger.clone();
 
-        let net = self.net.clone();
         let fut = async move {
             net.send(cmd).await??;
             let raw = trigger.await?;
@@ -253,15 +257,13 @@ where
                 Ok(vec) => Ok(vec),
                 Err(err) => Err(ProtocolError::Call(err).into()),
             }
-        };
+        }
+        .map_err(move |e: Error| {
+            trigger_err.ready(Err(e.clone()));
+            e
+        });
 
-        ActorResponse::r#async(
-            fut.map_err(move |e: Error| {
-                trigger_err.ready(Err(e.clone()));
-                e
-            })
-            .into_actor(self),
-        )
+        ActorResponse::r#async(fut.into_actor(self))
     }
 }
 
@@ -324,15 +326,14 @@ where
                         _ => return Err(Error::from(DiscoveryError::NotFound)),
                     };
 
-                    proto
-                        .send(Unicast {
-                            caller,
-                            callee,
-                            addr,
-                            body,
-                            node_key: dht_value,
-                        })
-                        .await?
+                    let msg = Unicast {
+                        caller,
+                        callee,
+                        addr,
+                        body,
+                        node_key: dht_value,
+                    };
+                    proto.send(msg).await?
                 }
                 .map_err(gsb_error)
                 .boxed_local()
@@ -376,9 +377,6 @@ enum NetRpcMessage {
     },
     Response {
         request_id: usize,
-        body: Vec<u8>,
-    },
-    Broadcast {
         body: Vec<u8>,
     },
 }
