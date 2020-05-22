@@ -22,6 +22,11 @@ pub struct Key<N: KeyLen> {
 }
 
 impl<N: KeyLen> Key<N> {
+    pub fn new(bytes: impl Into<GenericArray<u8, N>>) -> Self {
+        let inner = bytes.into();
+        Self { inner }
+    }
+
     pub fn distance<O: AsRef<[u8]>>(&self, other: &O) -> Self {
         let other = other.as_ref();
         let l = other.len();

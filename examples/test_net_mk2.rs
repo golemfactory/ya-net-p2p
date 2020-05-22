@@ -181,7 +181,6 @@ impl Crypto<Key> for CryptoExample {
     }
 
     #[inline]
-    #[inline]
     fn verify<H: AsRef<[u8]>>(
         &self,
         key: Option<Key>,
