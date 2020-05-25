@@ -7,7 +7,7 @@ use crate::serialize::{from_read as deser, to_vec as ser};
 use crate::transport::Address;
 use actix::prelude::*;
 use futures::future::LocalBoxFuture;
-use futures::{FutureExt, TryFutureExt};
+use futures::{FutureExt, StreamExt, TryFutureExt};
 use hashbrown::HashMap;
 use serde::de::DeserializeOwned;
 use serde::export::PhantomData;
@@ -21,10 +21,10 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::SeqCst;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
-use ya_client_model::NodeId;
-use ya_core_model::net;
-use ya_service_bus::untyped::{send as router_send, subscribe_recipient};
+use ya_service_bus::untyped::{send as router_send, subscribe, RawHandler};
 use ya_service_bus::{Handle, RpcRawCall};
+
+static CALL_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
 impl From<Error> for ya_service_bus::Error {
     fn from(err: Error) -> Self {
@@ -57,7 +57,7 @@ where
     conf: ProtocolConfig,
     net: Recipient<SendCmd<Key>>,
     dht: Recipient<DhtCmd<Key>>,
-    requests: RequestMap<Result<Vec<u8>, Error>>,
+    requests: HashMap<usize, TriggerFut<Result<Vec<u8>, Error>>>,
     handle: Option<Handle>,
 }
 
@@ -89,13 +89,13 @@ where
             conf,
             net: net.clone().into(),
             dht: dht.clone().into(),
-            requests: RequestMap::default(),
+            requests: HashMap::default(),
             handle: None,
         }
     }
 
     fn upkeep(&mut self, _: &mut Context<Self>) {
-        self.requests.remove_ready();
+        self.requests.retain(|_, t| t.is_pending());
     }
 }
 
@@ -135,6 +135,42 @@ where
             packet,
         })
     }
+
+    fn handle_rpc_message<'a>(
+        &mut self,
+        key: Key,
+        msg: NetRpcMessage,
+    ) -> LocalBoxFuture<'a, Result<(), Error>> {
+        match msg {
+            NetRpcMessage::Request {
+                request_id,
+                caller,
+                callee: _,
+                addr,
+                body,
+            } => {
+                let net = self.net.clone();
+                async move {
+                    let response = router_send(addr.as_str(), caller.as_str(), body.as_slice())
+                        .map_err(|e| e.to_string())
+                        .await;
+
+                    let payload = ser(&response)?;
+                    net.send(Self::build_response(key, request_id, payload)?)
+                        .await??;
+                    Ok(())
+                }
+                .boxed_local()
+            }
+            NetRpcMessage::Response { request_id, body } => {
+                match self.requests.remove(&request_id) {
+                    Some(mut request) => request.ready(Ok(body)),
+                    None => log::warn!("Unknown request id: {}", request_id),
+                }
+                futures::future::ok(()).boxed_local()
+            }
+        }
+    }
 }
 
 impl<Key> Actor for ServiceBusProtocol<Key>
@@ -148,8 +184,14 @@ where
             .finish()
             .spawn(ctx);
 
-        let handle = subscribe_recipient(net::BUS_ID, ctx.address().recipient());
-        self.handle.replace(handle);
+        self.handle.replace(subscribe(
+            "/net",
+            ServiceBusHandler {
+                proto: ctx.address(),
+                net: self.net.clone(),
+                dht: self.dht.clone(),
+            },
+        ));
 
         log::info!("GSB-net protocol started");
     }
@@ -172,40 +214,8 @@ where
                     Ok(msg) => msg,
                     Err(err) => return ActorResponse::reply(Err(err.into())),
                 };
-
-                match msg {
-                    NetRpcMessage::Request {
-                        request_id,
-                        caller,
-                        callee: _,
-                        addr,
-                        body,
-                    } => {
-                        let net = self.net.clone();
-                        let fut = async move {
-                            let response =
-                                router_send(addr.as_str(), caller.as_str(), body.as_slice())
-                                    .map_err(|e| e.to_string())
-                                    .await;
-
-                            let payload = ser(&response)?;
-                            net.send(Self::build_response(key, request_id, payload)?)
-                                .await??;
-                            Ok(())
-                        };
-
-                        ActorResponse::r#async(fut.into_actor(self))
-                    }
-                    NetRpcMessage::Response { request_id, body } => {
-                        match self.requests.remove(&request_id) {
-                            Some(mut request) => request.ready(Ok(body)),
-                            None => log::warn!("Unknown request id: {}", request_id),
-                        }
-
-                        ActorResponse::reply(Ok(()))
-                    }
-                    NetRpcMessage::Broadcast { body: _ } => unimplemented!(),
-                }
+                let fut = self.handle_rpc_message(key, msg);
+                ActorResponse::r#async(fut.into_actor(self))
             }
             ProtocolCmd::RoamingPacket(_, _) => {
                 let err = SessionError::Disconnected;
@@ -219,72 +229,6 @@ where
     }
 }
 
-impl<Key> Handler<RpcRawCall> for ServiceBusProtocol<Key>
-where
-    Key: Hash + Eq + Clone + Debug + Unpin + Send + TryFrom<Vec<u8>> + 'static,
-{
-    type Result = ActorResponse<Self, Vec<u8>, ya_service_bus::Error>;
-
-    fn handle(&mut self, mut msg: RpcRawCall, ctx: &mut Self::Context) -> Self::Result {
-        let parsed = match parse_addr(&msg.addr) {
-            Ok(res) => res,
-            Err(err) => return ActorResponse::reply(Err(err.into())),
-        };
-
-        match parsed {
-            ParsedAddr::Broadcast => {
-                let net = self.net.clone();
-                let cmd = SendCmd::Broadcast {
-                    from: None,
-                    packet: Packet {
-                        guarantees: Guarantees::unordered(),
-                        payload: Payload::new(Self::PROTOCOL_ID)
-                            .with_payload(msg.body)
-                            .with_signature(),
-                    },
-                };
-
-                let fut = async move {
-                    net.send(cmd).await??;
-                    Ok(Vec::new())
-                };
-
-                ActorResponse::r#async(fut.into_actor(self))
-            }
-            ParsedAddr::Unicast(callee, addr) => {
-                msg.addr = addr;
-
-                let actor = ctx.address();
-                let dht = self.dht.clone();
-
-                let fut = async move {
-                    let node_id = NodeId::from_str(callee.as_str())?;
-
-                    let dht_key = node_id.into_array().to_vec();
-                    let dht_value = match dht.send(DhtCmd::ResolveValue(dht_key)).await?? {
-                        DhtResponse::Value(vec) => {
-                            Key::try_from(vec).map_err(|_| CryptoError::InvalidKey)?
-                        }
-                        _ => return Err(Error::from(DiscoveryError::NotFound)),
-                    };
-
-                    actor
-                        .send(Unicast {
-                            caller: msg.caller,
-                            callee,
-                            addr: msg.addr,
-                            body: msg.body,
-                            node_key: dht_value,
-                        })
-                        .await?
-                };
-
-                ActorResponse::r#async(fut.map_err(|e| e.into()).into_actor(self))
-            }
-        }
-    }
-}
-
 impl<Key> Handler<Unicast<Key>> for ServiceBusProtocol<Key>
 where
     Key: Hash + Eq + Clone + Debug + Unpin + Send + TryFrom<Vec<u8>> + 'static,
@@ -292,19 +236,20 @@ where
     type Result = ActorResponse<Self, Vec<u8>, Error>;
 
     fn handle(&mut self, mut msg: Unicast<Key>, _ctx: &mut Self::Context) -> Self::Result {
-        let request_id = self.requests.next_seq();
+        let request_id = CALL_SEQUENCE.fetch_add(1, SeqCst);
         let cmd = match Self::build_request(request_id, msg) {
             Ok(cmd) => cmd,
             Err(err) => return ActorResponse::reply(Err(err.into())),
         };
 
+        let net = self.net.clone();
         let trigger = self
             .requests
-            .entry(request_id, TriggerFut::default())
+            .entry(request_id)
+            .or_insert_with(TriggerFut::default)
             .clone();
         let mut trigger_err = trigger.clone();
 
-        let net = self.net.clone();
         let fut = async move {
             net.send(cmd).await??;
             let raw = trigger.await?;
@@ -312,19 +257,92 @@ where
                 Ok(vec) => Ok(vec),
                 Err(err) => Err(ProtocolError::Call(err).into()),
             }
-        };
+        }
+        .map_err(move |e: Error| {
+            trigger_err.ready(Err(e.clone()));
+            e
+        });
 
-        ActorResponse::r#async(
-            fut.map_err(move |e: Error| {
-                trigger_err.ready(Err(e.clone()));
-                e
-            })
-            .into_actor(self),
-        )
+        ActorResponse::r#async(fut.into_actor(self))
     }
 }
 
-fn parse_addr(src: &String) -> Result<ParsedAddr, Error> {
+struct ServiceBusHandler<Key>
+where
+    Key: Hash + Eq + Clone + Debug + Unpin + Send + TryFrom<Vec<u8>> + 'static,
+{
+    proto: Addr<ServiceBusProtocol<Key>>,
+    net: Recipient<SendCmd<Key>>,
+    dht: Recipient<DhtCmd<Key>>,
+}
+
+impl<Key> RawHandler for ServiceBusHandler<Key>
+where
+    Key: Hash + Eq + Clone + Debug + Unpin + Send + TryFrom<Vec<u8>> + 'static,
+{
+    type Result = LocalBoxFuture<'static, std::result::Result<Vec<u8>, ya_service_bus::Error>>;
+
+    fn handle(&mut self, caller: &str, addr: &str, msg: &[u8]) -> Self::Result {
+        let parsed = match parse_addr(addr) {
+            Ok(res) => res,
+            Err(err) => return async move { Err(gsb_error(err)) }.boxed_local(),
+        };
+
+        let caller = caller.to_string();
+        let body = msg.to_vec();
+        let net = self.net.clone();
+
+        match parsed {
+            ParsedAddr::Broadcast => {
+                let cmd = SendCmd::Broadcast {
+                    from: None,
+                    packet: Packet {
+                        guarantees: Guarantees::unordered(),
+                        payload: Payload::new(ServiceBusProtocol::<Key>::PROTOCOL_ID)
+                            .with_payload(msg.to_vec())
+                            .with_signature(),
+                    },
+                };
+
+                async move {
+                    net.send(cmd).await??;
+                    Ok(Vec::new())
+                }
+                .map_err(|e: Error| gsb_error(e))
+                .boxed_local()
+            }
+            ParsedAddr::Unicast(callee, addr) => {
+                let proto = self.proto.clone();
+                let dht = self.dht.clone();
+
+                async move {
+                    let dht_key = hex::decode(&callee[2..]).map_err(|e| {
+                        Error::from(ProtocolError::Call(format!("Invalid address: {}", callee)))
+                    })?;
+                    let dht_value = match dht.send(DhtCmd::ResolveValue(dht_key)).await?? {
+                        DhtResponse::Value(vec) => {
+                            Key::try_from(vec).map_err(|_| CryptoError::InvalidKey)?
+                        }
+                        _ => return Err(Error::from(DiscoveryError::NotFound)),
+                    };
+
+                    let msg = Unicast {
+                        caller,
+                        callee,
+                        addr,
+                        body,
+                        node_key: dht_value,
+                    };
+                    proto.send(msg).await?
+                }
+                .map_err(gsb_error)
+                .boxed_local()
+            }
+        }
+    }
+}
+
+fn parse_addr(src: &str) -> Result<ParsedAddr, Error> {
     let split: Vec<_> = src.splitn(4, '/').collect();
     let to = split[2];
 
@@ -338,23 +356,18 @@ fn parse_addr(src: &String) -> Result<ParsedAddr, Error> {
     }
 }
 
+#[inline]
+fn gsb_error(err: impl ToString) -> ya_service_bus::Error {
+    ya_service_bus::Error::GsbBadRequest(err.to_string())
+}
+
 enum ParsedAddr {
     Unicast(String, String),
     Broadcast,
 }
 
-#[derive(Clone, Debug, Message)]
-#[rtype(result = "Result<Vec<u8>, Error>")]
-struct Unicast<Key> {
-    caller: String,
-    callee: String,
-    addr: String,
-    body: Vec<u8>,
-    node_key: Key,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum NetRpcMessage {
+enum NetRpcMessage {
     Request {
         request_id: usize,
         caller: String,
@@ -366,44 +379,14 @@ pub enum NetRpcMessage {
         request_id: usize,
         body: Vec<u8>,
     },
-    Broadcast {
-        body: Vec<u8>,
-    },
 }
 
-#[derive(Debug)]
-struct RequestMap<T: Clone> {
-    calls: HashMap<usize, TriggerFut<T>>,
-    sequence: AtomicUsize,
-}
-
-impl<T: Clone> Default for RequestMap<T> {
-    fn default() -> Self {
-        RequestMap {
-            calls: HashMap::new(),
-            sequence: AtomicUsize::new(0),
-        }
-    }
-}
-
-impl<T: Clone> RequestMap<T> {
-    #[inline]
-    fn next_seq(&self) -> usize {
-        self.sequence.fetch_add(1, SeqCst)
-    }
-
-    #[inline]
-    fn entry(&mut self, id: usize, value: TriggerFut<T>) -> &mut TriggerFut<T> {
-        self.calls.entry(id).or_insert(value)
-    }
-
-    #[inline]
-    fn remove(&mut self, id: &usize) -> Option<TriggerFut<T>> {
-        self.calls.remove(id)
-    }
-
-    #[inline]
-    fn remove_ready(&mut self) {
-        self.calls.retain(|_, t| t.is_pending());
-    }
+#[derive(Clone, Debug, Message)]
+#[rtype(result = "Result<Vec<u8>, Error>")]
+struct Unicast<Key> {
+    caller: String,
+    callee: String,
+    addr: String,
+    body: Vec<u8>,
+    node_key: Key,
 }

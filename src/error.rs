@@ -1,7 +1,6 @@
 use crate::protocol::ProtocolId;
 use crate::transport::{Address, TransportId};
 use std::sync::Arc;
-use ya_client_model::node_id::ParseError;
 
 #[derive(thiserror::Error, Clone, Debug)]
 pub enum NetworkError {
@@ -9,13 +8,13 @@ pub enum NetworkError {
     NoAddress,
     #[error("unsupported address: {0:?}")]
     UnsupportedAddress(Address),
-    #[error("unknown transport")]
+    #[error("unknown transport: {0}")]
     UnknownTransport(TransportId),
-    #[error("invalid transport")]
+    #[error("invalid transport: {0}")]
     InvalidTransport(TransportId),
-    #[error("unknown protocol")]
+    #[error("unknown protocol: {0}")]
     UnknownProtocol(ProtocolId),
-    #[error("not listening")]
+    #[error("not listening with transport: {0}")]
     NotListening(TransportId),
     #[error("no connection")]
     NoConnection,
@@ -138,13 +137,6 @@ impl Error {
 
     pub fn key_mismatch<A: AsRef<[u8]>, B: AsRef<[u8]>>(a: A, b: B) -> Self {
         SessionError::KeyMismatch(a.as_ref().to_vec(), b.as_ref().to_vec()).into()
-    }
-}
-
-#[cfg(feature = "yagna")]
-impl From<ethsign::Error> for Error {
-    fn from(err: ethsign::Error) -> Self {
-        Error::Signature(err.to_string())
     }
 }
 
