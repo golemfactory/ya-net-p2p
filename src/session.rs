@@ -12,25 +12,18 @@ use std::ops::Not;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug)]
-pub struct Session<Key>
-where
-    Key: Clone + Debug,
-{
+pub struct Session<Key: Clone> {
     state: Arc<Mutex<SessionState<Key>>>,
-    recent_conn: Arc<Mutex<Option<Connection<Key>>>>,
-    connections: Arc<Mutex<HashMap<Address, Connection<Key>>>>,
+    recent_conn: Arc<Mutex<Option<Connection>>>,
+    connections: Arc<Mutex<HashMap<Address, Connection>>>,
     future_state: Arc<Mutex<FutureState<bool>>>,
     future_id: usize,
 }
 
-impl<Key> Session<Key>
-where
-    Key: Clone + Debug,
-{
-    pub fn new(key: Key) -> Self {
+impl<Key: Clone> Session<Key> {
+    pub fn new(local: Key, remote: Key) -> Self {
         Session {
-            state: Arc::new(Mutex::new(SessionState::New(key))),
+            state: Arc::new(Mutex::new(SessionState::New(local, remote))),
             recent_conn: Arc::new(Mutex::new(None)),
             connections: Arc::new(Mutex::new(HashMap::new())),
             future_state: Arc::new(Mutex::new(FutureState::default())),
@@ -41,7 +34,7 @@ where
     #[inline]
     pub fn is_alive(&self) -> bool {
         match &(*self.state.lock().unwrap()) {
-            SessionState::Terminated(_) | SessionState::Poisoned => false,
+            SessionState::Terminated(_, _) | SessionState::Poisoned => false,
             _ => true,
         }
     }
@@ -49,7 +42,7 @@ where
     #[inline]
     pub fn is_established(&self) -> bool {
         match &(*self.state.lock().unwrap()) {
-            SessionState::Established(_) => true,
+            SessionState::Established(_, _) => true,
             _ => false,
         }
     }
@@ -59,39 +52,48 @@ where
         let connections = self.connections.lock().unwrap();
         connections.keys().cloned().collect()
     }
+
+    #[inline]
+    pub fn keys(&self) -> (Key, Key) {
+        self.state.lock().unwrap().keys()
+    }
 }
 
 impl<Key> Session<Key>
 where
-    Key: Clone + Debug + Eq,
+    Key: Clone + AsRef<[u8]>,
 {
-    pub fn add_connection(&mut self, conn: Connection<Key>) -> bool {
+    pub fn add_connection(&mut self, conn: Connection) -> bool {
         let mut state = self.state.lock().unwrap();
         let mut connections = self.connections.lock().unwrap();
         let mut added = false;
 
         *state = match std::mem::replace(&mut *state, SessionState::Poisoned) {
-            SessionState::New(key) => {
-                if Self::connected(&mut *connections, &key, conn.clone()) {
-                    log::info!("Session established ({:?}): {:?}", conn.address, key);
+            SessionState::New(local, remote) => {
+                if Self::connected(&mut *connections, &local, &remote, conn.clone()) {
+                    log::info!(
+                        "Session established ({:?}): {}",
+                        conn.address,
+                        hex::encode(remote.as_ref())
+                    );
                     self.recent_conn.lock().unwrap().replace(conn);
                     self.future_state.lock().unwrap().ready(true);
                     added = true;
-                    SessionState::Established(key)
+                    SessionState::Established(local, remote)
                 } else {
-                    SessionState::New(key)
+                    SessionState::New(local, remote)
                 }
             }
-            SessionState::Established(key) => {
-                if Self::connected(&mut *connections, &key, conn.clone()) {
+            SessionState::Established(local, remote) => {
+                if Self::connected(&mut *connections, &local, &remote, conn.clone()) {
                     self.recent_conn.lock().unwrap().replace(conn);
                     added = true;
                 }
-                SessionState::Established(key)
+                SessionState::Established(local, remote)
             }
-            SessionState::Terminated(key) => {
+            SessionState::Terminated(local, remote) => {
                 log::debug!("New connection for a terminated session {:?}", conn.address);
-                SessionState::Terminated(key)
+                SessionState::Terminated(local, remote)
             }
             SessionState::Poisoned => panic!("Programming error: poisoned session state"),
         };
@@ -101,29 +103,22 @@ where
 
     pub async fn add_future_connection<F, Fut>(
         &mut self,
-        mut futs: Vec<ConnectionFut<Key>>,
+        mut futs: Vec<ConnectionFut>,
         start_session: F,
     ) -> Result<()>
     where
-        F: Fn(Connection<Key>) -> Fut,
+        F: Fn(Connection) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
         while futs.is_empty().not() {
             let (conn, remaining) = futures::future::select_ok(futs).await?;
             futs = remaining;
-
-            if let Some(_) = conn.ctx() {
-                if self.add_connection(conn) {
-                    break;
-                }
-            } else {
-                start_session(conn).await?;
-            }
+            start_session(conn).await?;
         }
         Ok(())
     }
 
-    pub fn remove_connection(&mut self, conn: &Connection<Key>) {
+    pub fn remove_connection(&mut self, conn: &Connection) {
         let established = self.is_established();
         let now_empty = {
             let mut connections = self.connections.lock().unwrap();
@@ -133,46 +128,60 @@ where
 
         if established && now_empty {
             self.terminate();
+        } else {
+            let mut recent_conn_id = {
+                self.recent_conn
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|conn| conn.id)
+            };
+            if recent_conn_id.map(|id| id == conn.id).unwrap_or(false) {
+                self.update_recent()
+            }
         }
     }
 
     pub fn terminate(&mut self) {
-        let key = { self.key() };
+        let keys = { self.keys() };
         let mut state = self.state.lock().unwrap();
 
-        match std::mem::replace(&mut (*state), SessionState::Terminated(key.clone())) {
-            SessionState::Terminated(_) => (),
+        match std::mem::replace(
+            &mut (*state),
+            SessionState::Terminated(keys.0, keys.1.clone()),
+        ) {
+            SessionState::Terminated(_, _) => (),
             _ => {
-                log::debug!("Terminating session {:?}", key);
+                log::debug!("Terminating session {}", hex::encode(keys.1.as_ref()));
+                (self.recent_conn.lock().unwrap().take());
                 (*self.connections.lock().unwrap()).clear();
                 (*self.future_state.lock().unwrap()).ready(false);
             }
         };
     }
 
-    #[inline]
-    fn connected(
-        connections: &mut HashMap<Address, Connection<Key>>,
-        key: &Key,
-        mut conn: Connection<Key>,
-    ) -> bool {
-        match conn.ctx().map(|k| (&k == key, k)) {
-            None => conn.set_ctx(key.clone()),
-            Some((false, conn_key)) => {
-                log::error!("Session key mismatch: {:?} vs {:?} (conn)", key, conn_key);
-                return false;
-            }
-            _ => (),
+    fn update_recent(&mut self) {
+        let connections = self.connections.lock().unwrap();
+        if let Some(conn) = connections.values().next().cloned() {
+            self.recent_conn.lock().unwrap().replace(conn);
         }
+    }
 
-        connections.insert(conn.address, conn);
-        true
+    #[inline(always)]
+    fn connected(
+        connections: &mut HashMap<Address, Connection>,
+        local: &Key,
+        remote: &Key,
+        mut conn: Connection,
+    ) -> bool {
+        conn.slot(local, remote);
+        connections.insert(conn.address, conn).is_none()
     }
 }
 
 impl<Key> Session<Key>
 where
-    Key: Clone + Debug + 'static,
+    Key: Clone + 'static,
 {
     #[inline]
     pub fn send<P: Into<WirePacket> + 'static>(
@@ -189,20 +198,7 @@ where
     }
 }
 
-impl<Key> Session<Key>
-where
-    Key: Clone + Debug,
-{
-    #[inline]
-    pub fn key(&self) -> Key {
-        self.state.lock().unwrap().key().clone()
-    }
-}
-
-impl<Key> Clone for Session<Key>
-where
-    Key: Clone + Debug,
-{
+impl<Key: Clone> Clone for Session<Key> {
     fn clone(&self) -> Self {
         Session {
             state: self.state.clone(),
@@ -214,20 +210,14 @@ where
     }
 }
 
-impl<Key> Drop for Session<Key>
-where
-    Key: Clone + Debug,
-{
+impl<Key: Clone> Drop for Session<Key> {
     fn drop(&mut self) {
         let mut future_state = self.future_state.lock().unwrap();
         future_state.remove(&self.future_id);
     }
 }
 
-impl<Key> Future for Session<Key>
-where
-    Key: Clone + Debug,
-{
+impl<Key: Clone> Future for Session<Key> {
     type Output = Result<Self>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -244,20 +234,19 @@ where
     }
 }
 
-#[derive(Debug)]
-pub enum SessionState<Key> {
-    New(Key),
-    Established(Key),
-    Terminated(Key),
+pub enum SessionState<Key: Clone> {
+    New(Key, Key),
+    Established(Key, Key),
+    Terminated(Key, Key),
     Poisoned,
 }
 
-impl<Key> SessionState<Key> {
-    fn key(&self) -> &Key {
+impl<Key: Clone> SessionState<Key> {
+    fn keys(&self) -> (Key, Key) {
         match &self {
-            SessionState::New(key)
-            | SessionState::Established(key)
-            | SessionState::Terminated(key) => &key,
+            SessionState::New(local, remote)
+            | SessionState::Established(local, remote)
+            | SessionState::Terminated(local, remote) => (local.clone(), remote.clone()),
             SessionState::Poisoned => panic!("Programming error: poisoned session state"),
         }
     }

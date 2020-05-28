@@ -181,6 +181,10 @@ where
             Key::<N>::fmt_key(&key)
         );
 
+        for n in nodes.iter() {
+            log::debug!("Send out to {}", n);
+        }
+
         actix_rt::spawn(async move {
             for to in nodes.into_iter() {
                 log::trace!("Send out to: {} (distance: {})", to.key, to.distance(&key));

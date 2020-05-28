@@ -1,58 +1,69 @@
-use crate::error::{Error, MessageError};
+use crate::error::{Error, MessageError, ProtocolError, SessionError};
 use crate::event::{DisconnectReason, ProtocolCmd, SendCmd, SessionCmd, SessionEvt};
+use crate::identity::IdentityManager;
 use crate::packet::payload::Payload;
 use crate::packet::{Guarantees, Packet};
-use crate::protocol::{Protocol, ProtocolId};
+use crate::protocol::{Protocol, ProtocolId, ProtocolVersion};
 use crate::transport::Address;
+use crate::Identity;
 use actix::prelude::*;
-use futures::FutureExt;
+use futures::future::err as future_err;
+use futures::{FutureExt, TryFutureExt};
+use hashbrown::HashMap;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
 use std::convert::TryFrom;
 use std::fmt::Debug;
-use std::time::Duration;
+use std::hash::Hash;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::SeqCst;
+use std::time::{Duration, Instant};
 
 pub struct ProtocolConfig {
     upkeep_interval: Duration,
+    initiation_timeout: Duration,
 }
 
 impl Default for ProtocolConfig {
     fn default() -> Self {
         ProtocolConfig {
             upkeep_interval: Duration::from_secs(60),
+            initiation_timeout: Duration::from_secs(3),
         }
     }
 }
 
 pub struct SessionProtocol<Key>
 where
-    Key: Send + Debug + Clone + Unpin + 'static,
+    Key: Eq + Hash + Clone + Send + Unpin + 'static,
 {
     conf: ProtocolConfig,
     packets: Recipient<SendCmd<Key>>,
     events: Recipient<SessionEvt<Key>>,
-}
-
-impl<Key, E> Protocol<Key> for SessionProtocol<Key>
-where
-    Key: Send + Debug + Clone + Unpin + AsRef<[u8]> + TryFrom<Vec<u8>, Error = E> + 'static,
-    E: Into<Error> + 'static,
-{
-    const PROTOCOL_ID: ProtocolId = 0;
+    pending: HashMap<usize, SessionEntry<Key>>,
+    sequence: AtomicUsize,
+    identities: IdentityManager<Key>,
 }
 
 impl<Key> SessionProtocol<Key>
 where
-    Key: Send + Debug + Clone + Unpin + 'static,
+    Key: Eq + Hash + Clone + Send + Unpin + 'static,
 {
-    pub fn new<R, S>(packets: &R, events: &S) -> Self
+    pub fn new<R, S>(identities: &IdentityManager<Key>, packets: &R, events: &S) -> Self
     where
         R: Into<Recipient<SendCmd<Key>>> + Clone,
         S: Into<Recipient<SessionEvt<Key>>> + Clone,
     {
-        Self::with_config(ProtocolConfig::default(), packets, events)
+        Self::with_config(ProtocolConfig::default(), identities, packets, events)
     }
 
-    pub fn with_config<R, S>(conf: ProtocolConfig, packets: &R, events: &S) -> Self
+    pub fn with_config<R, S>(
+        conf: ProtocolConfig,
+        identities: &IdentityManager<Key>,
+        packets: &R,
+        events: &S,
+    ) -> Self
     where
         R: Into<Recipient<SendCmd<Key>>> + Clone,
         S: Into<Recipient<SessionEvt<Key>>> + Clone,
@@ -61,33 +72,22 @@ where
             conf,
             packets: packets.clone().into(),
             events: events.clone().into(),
+            pending: HashMap::new(),
+            sequence: AtomicUsize::new(0),
+            identities: identities.clone(),
         }
     }
 
-    fn handle_auth_response<'f, E>(
-        &mut self,
-        address: Address,
-        mut packet: Packet,
-    ) -> impl Future<Output = Result<(), Error>> + 'f
-    where
-        Key: TryFrom<Vec<u8>, Error = E>,
-        E: Into<Error>,
-    {
-        let sender = self.events.clone();
-        async move {
-            sender
-                .send(SessionEvt::Established(address, extract_key(&mut packet)?))
-                .await?;
-            Ok(())
-        }
+    fn upkeep(&mut self, _: &mut Context<Self>) {
+        let now = Instant::now();
+        let timeout = self.conf.initiation_timeout;
+        self.pending.retain(|id, e| e.created_at + timeout > now)
     }
-
-    fn upkeep(&mut self, _: &mut Context<Self>) {}
 }
 
 impl<Key> Actor for SessionProtocol<Key>
 where
-    Key: Send + Debug + Clone + Unpin + 'static,
+    Key: Eq + Hash + Send + Clone + Unpin + 'static,
 {
     type Context = Context<Self>;
 
@@ -104,56 +104,150 @@ where
     }
 }
 
+impl<Key, E> Protocol for SessionProtocol<Key>
+where
+    Key: Eq + Hash + Clone + Send + Unpin + AsRef<[u8]> + TryFrom<Vec<u8>, Error = E> + 'static,
+    E: Into<Error> + 'static,
+{
+    const ID: ProtocolId = 5355;
+    const VERSION: ProtocolVersion = 0;
+}
+
+impl<Key, E> SessionProtocol<Key>
+where
+    Key: Eq + Hash + Clone + Send + Unpin + AsRef<[u8]> + TryFrom<Vec<u8>, Error = E> + 'static,
+    E: Into<Error> + 'static,
+{
+    fn handle_request<'f>(
+        &mut self,
+        data: ProtocolData,
+        address: Address,
+        mut packet: Packet,
+    ) -> impl Future<Output = Result<(), Error>> + 'f {
+        let net = self.packets.clone();
+        let events = self.events.clone();
+        let identities = self.identities.clone();
+
+        async move {
+            let remote_raw = packet.signer().ok_or(MessageError::MissingAuth)?;
+            let remote_identity = data.from_identity;
+            let local_key = Key::try_from(data.to).map_err(Into::into)?;
+            let local_identity = {
+                identities
+                    .borrow()
+                    .get_identity(&local_key)
+                    .ok_or_else(|| Error::protocol("unknown local identity"))?
+            };
+
+            let msg = ProtocolMessage::SessionResponse(ProtocolData {
+                id: data.id,
+                from_identity: local_identity.clone(),
+                to: remote_raw.clone(),
+            });
+            net.send(SendCmd::Roaming {
+                from: Some(local_key.clone()),
+                to: address.clone(),
+                packet: Packet::try_ordered::<Self, _>(&msg)?.sign(),
+            })
+            .await??;
+
+            events
+                .send(SessionEvt::Established {
+                    from: local_key,
+                    from_identity: local_identity,
+                    to: Key::try_from(remote_raw).map_err(Into::into)?,
+                    to_identity: remote_identity,
+                    address,
+                })
+                .await?;
+
+            Ok(())
+        }
+    }
+
+    fn handle_response<'f>(
+        &mut self,
+        data: ProtocolData,
+        address: Address,
+        mut packet: Packet,
+    ) -> impl Future<Output = Result<(), Error>> + 'f {
+        let from = match packet.signer() {
+            Some(key) => key,
+            _ => return future_err(Error::protocol("Sender key missing")).left_future(),
+        };
+
+        match self.pending.get(&data.id) {
+            Some(pending) => {
+                if data.to.as_slice() != pending.from.as_ref() {
+                    return future_err(Error::protocol("Recipient key mismatch")).left_future();
+                }
+                if data.from_identity != pending.to_identity {
+                    return future_err(Error::protocol("Sender identity mismatch")).left_future();
+                }
+                if from.as_slice() != pending.to.as_ref() {
+                    return future_err(Error::protocol("Sender key mismatch")).left_future();
+                }
+            }
+            _ => return future_err(Error::protocol("Sender key mismatch")).left_future(),
+        }
+
+        let pending = self.pending.remove(&data.id).unwrap();
+        self.events
+            .send(SessionEvt::Established {
+                from: pending.from,
+                from_identity: pending.from_identity,
+                to: pending.to,
+                to_identity: pending.to_identity,
+                address,
+            })
+            .map_err(Error::from)
+            .right_future()
+    }
+}
+
 impl<Key, E> Handler<SessionCmd<Key>> for SessionProtocol<Key>
 where
-    Key: Send + Debug + Clone + Unpin + AsRef<[u8]> + TryFrom<Vec<u8>, Error = E> + 'static,
+    Key: Eq + Hash + Send + Clone + Unpin + AsRef<[u8]> + TryFrom<Vec<u8>, Error = E> + 'static,
     E: Into<Error> + 'static,
 {
     type Result = ActorResponse<Self, (), Error>;
 
     fn handle(&mut self, msg: SessionCmd<Key>, _: &mut Context<Self>) -> Self::Result {
         match msg {
-            SessionCmd::Initiate(address) => {
-                let payload = match Payload::new(Self::PROTOCOL_ID)
-                    .encode_payload(&ProtocolMessage::AuthRequest)
-                {
-                    Ok(payload) => payload.with_signature(),
-                    Err(error) => return ActorResponse::reply(Err(error)),
-                };
+            SessionCmd::Initiate {
+                from,
+                from_identity,
+                to,
+                to_identity,
+                address,
+            } => {
+                let id = self.sequence.fetch_add(1, SeqCst);
+                let to_raw = to.as_ref().to_vec();
+                let packets = self.packets.clone();
 
-                let fut = self
-                    .packets
-                    .send(SendCmd::Roaming {
-                        from: None,
-                        to: address,
-                        packet: Packet {
-                            payload,
-                            guarantees: Guarantees::ordered_default(),
+                self.pending.insert(
+                    id,
+                    SessionEntry::new(from.clone(), from_identity.clone(), to, to_identity),
+                );
+                let fut = async move {
+                    let packet = Packet::try_ordered::<Self, _>(ProtocolMessage::SessionRequest(
+                        ProtocolData {
+                            id,
+                            from_identity,
+                            to: to_raw,
                         },
-                    })
-                    .map(|_| Ok(()));
+                    ))?
+                    .sign();
 
-                ActorResponse::r#async(fut.into_actor(self))
-            }
-            SessionCmd::Disconnect(key, reason) => {
-                let payload = match Payload::new(Self::PROTOCOL_ID)
-                    .encode_payload(&ProtocolMessage::Disconnect(reason))
-                {
-                    Ok(payload) => payload.with_signature(),
-                    Err(error) => return ActorResponse::reply(Err(error)),
+                    packets
+                        .send(SendCmd::Roaming {
+                            from: Some(from),
+                            to: address,
+                            packet,
+                        })
+                        .await?;
+                    Ok(())
                 };
-
-                let fut = self
-                    .packets
-                    .send(SendCmd::Session {
-                        from: None,
-                        to: key,
-                        packet: Packet {
-                            payload,
-                            guarantees: Guarantees::ordered_default(),
-                        },
-                    })
-                    .map(|_| Ok(()));
 
                 ActorResponse::r#async(fut.into_actor(self))
             }
@@ -161,107 +255,74 @@ where
     }
 }
 
-impl<Key, E> Handler<ProtocolCmd<Key>> for SessionProtocol<Key>
+impl<Key, E> Handler<ProtocolCmd> for SessionProtocol<Key>
 where
-    Key: Send + Debug + Clone + Unpin + AsRef<[u8]> + TryFrom<Vec<u8>, Error = E> + 'static,
+    Key: Eq + Hash + Send + Clone + Unpin + AsRef<[u8]> + TryFrom<Vec<u8>, Error = E> + 'static,
     E: Into<Error> + 'static,
 {
     type Result = ActorResponse<Self, (), Error>;
 
-    fn handle(&mut self, msg: ProtocolCmd<Key>, ctx: &mut Context<Self>) -> Self::Result {
+    fn handle(&mut self, msg: ProtocolCmd, ctx: &mut Context<Self>) -> Self::Result {
         match msg {
-            ProtocolCmd::RoamingPacket(address, mut packet) => {
-                let payload = match packet.payload.decode_payload::<ProtocolMessage>() {
-                    Ok(payload) => payload,
-                    Err(error) => return ActorResponse::reply(Err(error)),
-                };
-
-                match &payload {
-                    ProtocolMessage::AuthRequest => {
-                        let key = match extract_key(&mut packet) {
-                            Ok(key) => key,
-                            Err(error) => return ActorResponse::reply(Err(error)),
-                        };
-
-                        let sender = self.events.clone();
-                        let packets = self.packets.clone();
-                        let fut = async move {
-                            packets
-                                .send(SendCmd::Roaming {
-                                    from: None,
-                                    to: address,
-                                    packet: Packet {
-                                        payload: Payload::new(Self::PROTOCOL_ID)
-                                            .encode_payload(&ProtocolMessage::AuthResponse)?
-                                            .with_signature(),
-                                        guarantees: Guarantees::ordered_default(),
-                                    },
-                                })
-                                .await??;
-                            sender.send(SessionEvt::Established(address, key)).await?;
-                            Ok(())
-                        };
-                        ActorResponse::r#async(fut.into_actor(self))
-                    }
-                    ProtocolMessage::AuthResponse => {
-                        let fut = self.handle_auth_response(address, packet);
-                        ActorResponse::r#async(fut.into_actor(self))
-                    }
-                    other => {
-                        log::warn!("Unexpected roaming packet: {:?}", other);
-                        ActorResponse::reply(Ok(()))
-                    }
-                }
+            ProtocolCmd::RoamingPacket {
+                address,
+                mut packet,
             }
-            ProtocolCmd::SessionPacket(address, packet, key) => {
-                let payload = match packet.payload.decode_payload::<ProtocolMessage>() {
+            | ProtocolCmd::SessionPacket {
+                address,
+                mut packet,
+                ..
+            } => {
+                let payload = match packet.payload.decode_body::<ProtocolMessage>() {
                     Ok(payload) => payload,
                     Err(error) => return ActorResponse::reply(Err(error)),
                 };
 
                 match payload {
-                    ProtocolMessage::AuthResponse => {
-                        let fut = self.handle_auth_response(address, packet);
+                    ProtocolMessage::SessionRequest(data) => {
+                        let fut = self.handle_request(data, address, packet);
                         ActorResponse::r#async(fut.into_actor(self))
                     }
-                    ProtocolMessage::Disconnect(reason) => {
-                        log::info!("Disconnecting session ({:?}): {:?}", address, reason);
-                        let sender = self.events.clone();
-                        let fut = sender.send(SessionEvt::Disconnected(key)).map(|_| Ok(()));
+                    ProtocolMessage::SessionResponse(data) => {
+                        let fut = self.handle_response(data, address, packet);
                         ActorResponse::r#async(fut.into_actor(self))
-                    }
-                    other => {
-                        log::warn!("Unexpected session packet: {:?}", other);
-                        ActorResponse::reply(Ok(()))
                     }
                 }
             }
-            ProtocolCmd::Shutdown => {
-                ctx.stop();
-                ActorResponse::reply(Ok(()))
-            }
+            ProtocolCmd::Shutdown => ActorResponse::reply(Ok(())),
         }
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 enum ProtocolMessage {
-    AuthRequest,
-    AuthResponse,
-    Disconnect(DisconnectReason),
+    SessionRequest(ProtocolData),
+    SessionResponse(ProtocolData),
 }
 
-fn extract_key<Key, E>(packet: &mut Packet) -> Result<Key, Error>
-where
-    Key: TryFrom<Vec<u8>, Error = E>,
-    E: Into<Error>,
-{
-    let sig = packet.payload.signature();
-    match sig.map(|sig| sig.key()).flatten() {
-        Some(key_vec) => match Key::try_from(key_vec) {
-            Ok(key) => Ok(key),
-            Err(e) => Err(e.into()),
-        },
-        _ => Err(MessageError::MissingSignature.into()),
+#[derive(Clone, Serialize, Deserialize)]
+struct ProtocolData {
+    id: usize,
+    from_identity: Identity,
+    to: Vec<u8>,
+}
+
+struct SessionEntry<Key> {
+    from: Key,
+    from_identity: Identity,
+    to: Key,
+    to_identity: Identity,
+    created_at: Instant,
+}
+
+impl<Key> SessionEntry<Key> {
+    fn new(from: Key, from_identity: Identity, to: Key, to_identity: Identity) -> Self {
+        Self {
+            from,
+            from_identity,
+            to,
+            to_identity,
+            created_at: Instant::now(),
+        }
     }
 }

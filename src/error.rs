@@ -64,6 +64,8 @@ pub enum MessageError {
     Signature(String),
     #[error("missing auth")]
     MissingAuth,
+    #[error("invalid auth")]
+    InvalidAuth,
     #[error("missing signature")]
     MissingSignature,
     #[error("unsupported signature")]
@@ -82,10 +84,12 @@ pub enum ChannelError {
 
 #[derive(thiserror::Error, Clone, Debug)]
 pub enum CryptoError {
-    #[error("invalid key")]
-    InvalidKey,
+    #[error("invalid key: {0}")]
+    InvalidKey(String),
     #[error("invalid scheme")]
     InvalidScheme,
+    #[error("cipher error: {0}")]
+    CipherError(String),
 }
 
 #[derive(thiserror::Error, Clone, Debug)]
@@ -131,8 +135,8 @@ impl Error {
         ProtocolError::InvalidState(e.to_string()).into()
     }
 
-    pub fn key() -> Self {
-        CryptoError::InvalidKey.into()
+    pub fn key(e: impl ToString) -> Self {
+        CryptoError::InvalidKey(e.to_string()).into()
     }
 
     pub fn key_mismatch<A: AsRef<[u8]>, B: AsRef<[u8]>>(a: A, b: B) -> Self {
