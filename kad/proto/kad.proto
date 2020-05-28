@@ -53,3 +53,15 @@ message Value {
     bytes value = 1;
     uint32 ttl = 2;
 }
+
+message KadMessage {
+    oneof payload {
+        Ping ping                   = 0x10;
+        Pong pong                   = 0x11;
+        Store store                 = 0x30;
+        FindNode find_node          = 0x40;
+        FindNodeResult find_node_result = 0x41;
+        FindValue find_value        = 0x42;
+        FindValueResult find_value_result = 0x43;
+    };
+}

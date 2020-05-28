@@ -10,7 +10,7 @@ use std::hash::Hash;
 use std::iter::FromIterator;
 
 pub mod lengths {
-    pub use generic_array::typenum::*;
+    pub use generic_array::typenum::{Unsigned, consts::*};
 }
 
 pub trait KeyLen: ArrayLength<u8> + Debug + Unpin + Clone + Ord + Hash {}

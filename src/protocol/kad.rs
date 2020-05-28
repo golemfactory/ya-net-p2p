@@ -227,7 +227,7 @@ where
                             key: Key::<N>::try_from(key_vec)?,
                             data: D::from_address(address),
                         },
-                        message: packet.payload.decode_payload()?,
+                        message: KadMessage::from_bytes(packet.payload.payload().vec())?,
                     })
                     .await??;
 
@@ -382,7 +382,7 @@ where
     fn try_from(evt: KadEvtSend<N, D>) -> std::result::Result<Self, Self::Error> {
         Ok(Packet {
             payload: Payload::new(KadProtocol::<N, D>::PROTOCOL_ID)
-                .encode_payload(&evt.message)?
+                .with_payload(evt.message.to_bytes()?)
                 .with_signature(),
             guarantees: Guarantees::unordered(),
         })
