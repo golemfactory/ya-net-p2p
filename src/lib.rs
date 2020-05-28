@@ -9,6 +9,9 @@ mod serialize;
 mod session;
 pub mod transport;
 
+mod status;
+pub use status::{ConnectionInfo, GetStatus, StatusInfo};
+
 mod service;
 pub use service::*;
 

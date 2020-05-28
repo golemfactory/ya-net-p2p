@@ -6,7 +6,7 @@ use crate::protocol::{Protocol, ProtocolId};
 use crate::session::Session;
 use crate::transport::connection::{ConnectionManager, PendingConnection};
 use crate::transport::{Address, Transport, TransportId};
-use crate::Result;
+use crate::{GetStatus, Result, StatusInfo};
 use actix::prelude::*;
 use futures::{Future, FutureExt, StreamExt, TryFutureExt};
 use hashbrown::{HashMap, HashSet};
@@ -32,7 +32,7 @@ where
     where
         A: Protocol<Key>;
 
-    fn set_dht<A>(&self, actor: A) -> Recipient<DhtCmd<Key>>
+    fn set_dht<A>(&self, actor: A) -> Addr<A>
     where
         A: Protocol<Key> + Handler<DhtCmd<Key>>;
 
@@ -542,6 +542,18 @@ where
     }
 }
 
+impl<Key> Handler<GetStatus> for Net<Key>
+where
+    Key: Unpin + Send + Clone + Debug + Hash + Eq + 'static,
+{
+    type Result = Result<StatusInfo>;
+
+    fn handle(&mut self, msg: GetStatus, ctx: &mut Context<Self>) -> Self::Result {
+        let connections = self.connections.status();
+        Ok(StatusInfo { connections })
+    }
+}
+
 impl<Key> Handler<internal::Connect<Key>> for Net<Key>
 where
     Key: Unpin + Send + Clone + Debug + Hash + Eq + 'static,
@@ -648,7 +660,7 @@ where
         recipient
     }
 
-    fn set_dht<A>(&self, actor: A) -> Recipient<DhtCmd<Key>>
+    fn set_dht<A>(&self, actor: A) -> Addr<A>
     where
         A: Protocol<Key> + Handler<DhtCmd<Key>>,
     {
@@ -659,7 +671,7 @@ where
                 A::PROTOCOL_ID,
                 addr.clone().recipient(),
             ));
-            addr.recipient()
+            addr
         }
     }
 

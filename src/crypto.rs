@@ -3,6 +3,10 @@ use crate::Result;
 use futures::future::LocalBoxFuture;
 use serde::{Deserialize, Serialize};
 
+mod nocrypto;
+
+pub use nocrypto::no_crypto;
+
 pub trait Crypto<Key>: Unpin {
     fn encrypt<'a, P: AsRef<[u8]>>(
         &self,
@@ -30,6 +34,7 @@ pub trait Crypto<Key>: Unpin {
 #[non_exhaustive]
 pub enum Signature {
     ECDSA(SignatureECDSA),
+    Plain(Vec<u8>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39,20 +44,23 @@ pub enum SignatureECDSA {
 }
 
 impl Signature {
-    pub fn data(&self) -> &Vec<u8> {
+    pub fn data(&self) -> &[u8] {
         match self {
-            Signature::ECDSA(ecdsa) => ecdsa.data(),
+            Signature::Plain(_) => &[],
+            Signature::ECDSA(ecdsa) => ecdsa.data().as_slice(),
         }
     }
 
     pub fn key(&self) -> Option<Vec<u8>> {
         match self {
+            Signature::Plain(key) => Some(key.clone()),
             Signature::ECDSA(ecdsa) => ecdsa.key(),
         }
     }
 
     pub fn set_key(&mut self, vec: Vec<u8>) {
         match self {
+            Signature::Plain(key) => *key = vec,
             Signature::ECDSA(ecdsa) => ecdsa.set_key(vec),
         }
     }

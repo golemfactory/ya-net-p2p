@@ -104,7 +104,8 @@ where
 
 unsafe impl<Key> Send for DhtCmd<Key> where Key: Send + Debug + Clone {}
 
-#[derive(Clone, Debug, MessageResponse)]
+#[derive(Clone, Debug, MessageResponse, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum DhtResponse {
     Addresses(Vec<Address>),
     Value(Vec<u8>),

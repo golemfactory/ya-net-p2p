@@ -41,6 +41,8 @@ env_logger = "0.7.1"
 rand="0.7.3"
 structopt = "0.3"
 url="2.1.1"
+actix-web = "2.0"
+actix-files="0.2"
 
 [[example]]
 name="test_net_mk2"

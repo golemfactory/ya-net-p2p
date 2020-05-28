@@ -2,7 +2,7 @@ use crate::common::TriggerFut;
 use crate::error::{ChannelError, Error, NetworkError};
 use crate::packet::{AddressedPacket, WirePacket};
 use crate::transport::Address;
-use crate::Result;
+use crate::{ConnectionInfo, Result};
 use futures::channel::mpsc::Sender;
 use futures::{Future, SinkExt, TryFutureExt};
 use hashbrown::HashMap;
@@ -187,5 +187,11 @@ impl<Ctx: Clone + Debug> ConnectionManager<Ctx> {
                     trigger.ready(Err(Error::from(NetworkError::Timeout)))
                 }
             });
+    }
+
+    pub fn status(&self) -> ConnectionInfo {
+        let pending = self.pending.keys().cloned().collect();
+        let active = self.established.keys().cloned().collect();
+        ConnectionInfo { pending, active }
     }
 }

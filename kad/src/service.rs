@@ -1,5 +1,6 @@
 use crate::event::*;
 use crate::query::*;
+use crate::status::{KadStatus, QueryKadStatus};
 use crate::table::AddNodeStatus;
 use crate::*;
 use actix::prelude::*;
@@ -283,7 +284,7 @@ where
         nodes
     }
 
-    fn find_value(&mut self, key: &Vec<u8>) -> Option<message::Value> {
+    fn find_value(&mut self, key: &[u8]) -> Option<message::Value> {
         if let Some(value) = self.node_storage.get(key) {
             return Some(message::Value {
                 value: value.value.clone(),
@@ -878,5 +879,22 @@ where
 
         std::mem::replace(&mut self.node.data, evt.data);
         Ok(())
+    }
+}
+
+impl<N, D> Handler<crate::status::QueryKadStatus> for Kad<N, D>
+where
+    N: KeyLen + 'static,
+    <N as ArrayLength<u8>>::ArrayType: Unpin,
+    D: NodeData + 'static,
+{
+    type Result = Result<KadStatus>;
+
+    fn handle(&mut self, msg: QueryKadStatus, ctx: &mut Context<Self>) -> Self::Result {
+        Ok(KadStatus {
+            host_node: KadStatusNodeInfo::from_node(&self.node),
+            nodes: self.table.status(),
+            ..Default::default()
+        })
     }
 }
