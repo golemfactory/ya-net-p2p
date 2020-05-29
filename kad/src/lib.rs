@@ -26,6 +26,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[error("Send error: {0}")]
     SendError(#[from] futures::channel::mpsc::SendError),
+    #[error("{0}")]
+    Encode(#[from] ::prost::EncodeError),
+    #[error("{0}")]
+    Decode(#[from] ::prost::DecodeError),
     #[error("Mailbox error: {0}")]
     MailboxError(#[from] actix::MailboxError),
     #[error("Invalid key length: {0}")]
@@ -44,6 +48,8 @@ pub enum Error {
     SerializationError(String),
     #[error("No message recipients")]
     NoRecipients,
+    #[error("unknown kad packet")]
+    UnknownPacket,
 }
 
 impl Error {
