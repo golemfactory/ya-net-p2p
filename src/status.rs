@@ -1,4 +1,4 @@
-use crate::{Address, Error};
+use crate::{transport::Address, Error};
 use actix::prelude::*;
 use serde::{Deserialize, Serialize};
 

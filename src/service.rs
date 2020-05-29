@@ -1,24 +1,28 @@
 use crate::common::FlattenResult;
-use crate::error::{Error, NetworkError, SessionError};
+use crate::error::{DiscoveryError, Error, MessageError, NetworkError, SessionError};
 use crate::event::*;
+use crate::identity::{to_slot, IdentityManager, Slot};
 use crate::packet::Packet;
 use crate::protocol::{Protocol, ProtocolId};
 use crate::session::Session;
 use crate::transport::connection::{ConnectionManager, PendingConnection};
 use crate::transport::{Address, Transport, TransportId};
-use crate::{GetStatus, Result, StatusInfo};
+use crate::{Identity, GetStatus, Result, StatusInfo};
 use actix::prelude::*;
 use futures::{Future, FutureExt, StreamExt, TryFutureExt};
 use hashbrown::{HashMap, HashSet};
+use std::cell::RefCell;
+use std::convert::identity;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::iter::FromIterator;
 use std::net::SocketAddr;
+use std::rc::Rc;
 use std::time::Duration;
 
 pub trait NetAddrExt<Key>
 where
-    Key: Send + Debug + Clone,
+    Key: Send + Debug + Clone + 'static,
 {
     fn add_processor<A>(&self, actor: A) -> Recipient<ProcessCmd<Key>>
     where
@@ -28,23 +32,23 @@ where
     where
         A: Transport;
 
-    fn add_protocol<A>(&self, actor: A) -> Recipient<ProtocolCmd<Key>>
+    fn add_protocol<A>(&self, actor: A) -> Recipient<ProtocolCmd>
     where
-        A: Protocol<Key>;
+        A: Protocol;
 
     fn set_dht<A>(&self, actor: A) -> Addr<A>
     where
-        A: Protocol<Key> + Handler<DhtCmd<Key>>;
+        A: Protocol + Handler<DhtCmd<Key>>;
 
     fn set_session<A>(&self, actor: A) -> Recipient<SessionCmd<Key>>
     where
-        A: Protocol<Key> + Handler<SessionCmd<Key>>;
+        A: Protocol + Handler<SessionCmd<Key>>;
 }
 
 #[derive(Clone, Debug)]
 pub struct NetConfig {
     connection_timeout: Duration,
-    session_timeout: Duration,
+    session_init_timeout: Duration,
     session_heartbeat_interval: Duration,
     upkeep_interval: Duration,
 }
@@ -53,41 +57,45 @@ impl Default for NetConfig {
     fn default() -> Self {
         NetConfig {
             connection_timeout: Duration::from_secs(5),
-            session_timeout: Duration::from_secs(5),
+            session_init_timeout: Duration::from_secs(5),
             session_heartbeat_interval: Duration::from_secs(2),
             upkeep_interval: Duration::from_secs(2),
         }
     }
 }
 
-#[derive(Debug)]
 pub struct Net<Key>
 where
-    Key: Unpin + Send + Clone + Debug + Hash + Eq,
+    Key: Unpin + Send + Clone + Debug + Hash + Eq + 'static,
 {
     conf: NetConfig,
     addresses: HashSet<SocketAddr>,
 
     transports: HashMap<TransportId, Recipient<TransportCmd>>,
-    protocols: HashMap<ProtocolId, Recipient<ProtocolCmd<Key>>>,
+    protocols: HashMap<ProtocolId, Recipient<ProtocolCmd>>,
     processors: Vec<Recipient<ProcessCmd<Key>>>,
 
     session_protocol: Option<Recipient<SessionCmd<Key>>>,
     dht_protocol: Option<Recipient<DhtCmd<Key>>>,
 
-    connections: ConnectionManager<Key>,
-    sessions: HashMap<Key, Session<Key>>,
+    connections: ConnectionManager,
+    sessions: Rc<RefCell<HashMap<(Slot, Slot), Session<Key>>>>,
+    identities: IdentityManager<Key>,
 }
 
 impl<Key> Net<Key>
 where
-    Key: Clone + Unpin + Send + Debug + Hash + Eq + 'static,
+    Key: Clone + Unpin + Send + Debug + Hash + Eq + AsRef<[u8]> + 'static,
 {
-    pub fn new(addresses: Vec<SocketAddr>) -> Self {
-        Self::with_config(addresses, NetConfig::default())
+    pub fn new(addresses: Vec<SocketAddr>, identities: IdentityManager<Key>) -> Self {
+        Self::with_config(addresses, identities, NetConfig::default())
     }
 
-    pub fn with_config(addresses: Vec<SocketAddr>, conf: NetConfig) -> Self {
+    pub fn with_config(
+        addresses: Vec<SocketAddr>,
+        identities: IdentityManager<Key>,
+        conf: NetConfig,
+    ) -> Self {
         Net {
             conf,
             addresses: HashSet::from_iter(addresses.into_iter()),
@@ -97,53 +105,9 @@ where
             session_protocol: None,
             dht_protocol: None,
             connections: ConnectionManager::default(),
-            sessions: HashMap::new(),
+            sessions: Rc::new(RefCell::new(HashMap::new())),
+            identities,
         }
-    }
-}
-
-impl<Key> Net<Key>
-where
-    Key: Clone + Unpin + Send + Debug + Hash + Eq + 'static,
-{
-    fn session(
-        &mut self,
-        key: Key,
-        actor: Addr<Self>,
-    ) -> impl Future<Output = Result<Session<Key>>> {
-        if let Some(session) = self.sessions.get(&key).cloned() {
-            return async move { Ok(session.await?) }.left_future();
-        }
-
-        let mut session = self
-            .sessions
-            .entry(key.clone())
-            .or_insert(Session::new(key.clone()))
-            .clone();
-
-        let dht = self.dht_protocol.clone();
-        let proto = self.session_protocol.clone();
-
-        async move {
-            let dht = dht.ok_or_else(|| Error::protocol("No discovery protocol"))?;
-            let proto = proto.ok_or_else(|| Error::protocol("No session protocol"))?;
-            let addresses = dht
-                .send(DhtCmd::ResolveNode(key.clone()))
-                .await??
-                .into_addresses()?;
-            let conns = actor.send(internal::Connect::new(addresses)).await??;
-
-            session
-                .add_future_connection(conns, |conn| {
-                    proto
-                        .send(SessionCmd::Initiate(conn.address))
-                        .map(|r| r.flatten_result())
-                })
-                .await?;
-
-            Ok(session.await?)
-        }
-        .right_future()
     }
 
     fn upkeep(&mut self, _: &mut Context<Self>) {
@@ -153,18 +117,17 @@ where
 
 impl<Key> Net<Key>
 where
-    Key: Clone + Unpin + Send + Debug + Hash + Eq + 'static,
+    Key: Clone + Unpin + Send + Debug + Hash + Eq + AsRef<[u8]> + 'static,
 {
     #[inline]
-    fn process_outbound<'a>(
-        &self,
-        from: Option<Key>,
-        to: Option<Key>,
+    fn process_outbound<'f>(
+        processors: Vec<Recipient<ProcessCmd<Key>>>,
+        from: Option<&'f Key>,
+        to: Option<&'f Key>,
         packet: Packet,
-    ) -> impl Future<Output = Result<Packet>> + 'a {
-        let iter = self.processors.clone().into_iter();
-        futures::stream::iter(iter)
-            .map(move |recipient| (recipient, from.clone(), to.clone()))
+    ) -> impl Future<Output = Result<Packet>> + 'f {
+        futures::stream::iter(processors.into_iter())
+            .map(move |recipient| (recipient, from.cloned(), to.cloned()))
             .fold(Ok(packet), move |res, (recipient, from, to)| async move {
                 match res {
                     Ok(packet) => recipient
@@ -177,15 +140,14 @@ where
     }
 
     #[inline]
-    fn process_inbound<'a>(
-        &self,
-        from: Option<Key>,
-        to: Option<Key>,
+    fn process_inbound<'f>(
+        processors: Vec<Recipient<ProcessCmd<Key>>>,
+        from: Option<&'f Key>,
+        to: Option<&'f Key>,
         packet: Packet,
-    ) -> impl Future<Output = Result<Packet>> + 'a {
-        let iter = self.processors.clone().into_iter().rev();
-        futures::stream::iter(iter)
-            .map(move |recipient| (recipient, from.clone(), to.clone()))
+    ) -> impl Future<Output = Result<Packet>> + 'f {
+        futures::stream::iter(processors.into_iter().rev())
+            .map(move |recipient| (recipient, from.cloned(), to.cloned()))
             .fold(Ok(packet), move |res, (recipient, from, to)| async move {
                 match res {
                     Ok(packet) => recipient
@@ -200,7 +162,7 @@ where
 
 impl<Key> Actor for Net<Key>
 where
-    Key: Unpin + Send + Clone + Debug + Hash + Eq + 'static,
+    Key: Unpin + Send + Clone + Debug + Hash + Eq + AsRef<[u8]> + 'static,
 {
     type Context = Context<Self>;
 
@@ -219,7 +181,7 @@ where
 
 impl<Key> Handler<ServiceCmd<Key>> for Net<Key>
 where
-    Key: Clone + Unpin + Send + Debug + Hash + Eq + 'static,
+    Key: Clone + Unpin + Send + Debug + Hash + Eq + AsRef<[u8]> + 'static,
 {
     type Result = ActorResponse<Self, (), Error>;
 
@@ -293,10 +255,8 @@ where
 
                 let actor = ctx.address();
 
+                self.sessions.borrow_mut().clear();
                 std::mem::replace(&mut self.connections, ConnectionManager::default());
-                std::mem::replace(&mut self.sessions, HashMap::new())
-                    .into_iter()
-                    .for_each(|(_, mut s)| s.terminate());
 
                 let protocols_fut = std::mem::replace(&mut self.protocols, HashMap::new())
                     .into_iter()
@@ -308,8 +268,6 @@ where
                 let fut = async move {
                     futures::future::join_all(protocols_fut).await;
                     futures::future::join_all(transports_fut).await;
-
-                    actor.send(internal::Shutdown).await?;
                     Ok(())
                 };
 
@@ -321,7 +279,7 @@ where
 
 impl<Key> Handler<SendCmd<Key>> for Net<Key>
 where
-    Key: Clone + Unpin + Send + Debug + Hash + Eq + 'static,
+    Key: Clone + Unpin + Send + Debug + Hash + Eq + AsRef<[u8]> + 'static,
 {
     type Result = ActorResponse<Self, (), Error>;
 
@@ -330,48 +288,39 @@ where
             SendCmd::Roaming {
                 from,
                 mut to,
-                packet,
+                mut packet,
             } => {
                 log::debug!("Send roaming message to: {:?}", to);
+                packet = packet.sign();
 
                 let conn = match to.transport_id {
-                    Address::ANY_TRANSPORT => {
-                        let keys = self.transports.keys();
-                        keys.filter_map(|id| {
+                    Address::ANY_TRANSPORT => self
+                        .transports
+                        .keys()
+                        .filter_map(|id| {
                             to.transport_id = *id;
                             self.connections.get(&to)
                         })
-                        .next()
-                    }
+                        .next(),
                     _ => self.connections.get(&to),
                 };
 
-                let fut = match conn {
-                    Some(conn) => {
-                        let mut conn = conn.clone();
-                        let process_fut = self.process_outbound(from, None, packet);
-
-                        async move {
-                            let packet = process_fut.await?;
-                            conn.send(packet).await?;
-                            Ok(())
-                        }
-                        .left_future()
+                let processors = self.processors.clone();
+                let fut = match conn.cloned() {
+                    Some(mut conn) => async move {
+                        let packet =
+                            Self::process_outbound(processors, from.as_ref(), None, packet).await?;
+                        conn.send(packet).await?;
+                        Ok(())
                     }
+                    .left_future(),
                     None => {
                         let actor = ctx.address();
-                        let addresses = vec![to.clone()];
-
                         async move {
-                            let conns = actor.send(internal::Connect::new(addresses)).await??;
+                            let conns = actor.send(internal::Connect(vec![to.clone()])).await??;
                             let conn = futures::future::select_ok(conns.into_iter()).await?.0;
-                            actor
-                                .send(SendCmd::Roaming {
-                                    from,
-                                    to: conn.address,
-                                    packet,
-                                })
-                                .await?
+                            let to = conn.address;
+                            actor.send(SendCmd::Roaming { from, to, packet }).await?
                         }
                         .right_future()
                     }
@@ -379,60 +328,95 @@ where
 
                 ActorResponse::r#async(fut.into_actor(self))
             }
-            SendCmd::Session { from, to, packet } => {
-                log::debug!("Send session message to: {:?}", to);
+            SendCmd::Session {
+                from,
+                to,
+                mut packet,
+            } => {
+                log::debug!("Send session message to: {}", to);
+                packet = packet.encrypt();
 
                 let actor = ctx.address();
-                let fut = async move { actor.send(internal::Send { from, to, packet }).await? };
+                let dht = self.dht_protocol.clone();
+                let proto = self.session_protocol.clone();
+                let processors = self.processors.clone();
+                let sessions = self.sessions.clone();
+                let identities = self.identities.clone();
+                let timeout = self.conf.session_init_timeout;
 
-                ActorResponse::r#async(fut.into_actor(self))
-            }
-            SendCmd::Broadcast { from, packet } => {
-                if self.sessions.is_empty() {
-                    return ActorResponse::reply(Err(NetworkError::NoConnection.into()));
-                }
-
-                let actor = ctx.address();
-                let futs = self
-                    .sessions
-                    .values()
-                    .map(|s| {
-                        actor.send(internal::Send {
-                            from: from.clone(),
-                            to: s.key(),
-                            packet: packet.clone(),
-                        })
-                    })
-                    .collect::<Vec<_>>();
-
-                Arbiter::spawn(async move {
-                    let _ = futures::future::join_all(futs.into_iter()).await;
-                });
-                ActorResponse::reply(Ok(()))
-            }
-            SendCmd::Disconnect(key, reason) => {
-                if !self.sessions.contains_key(&key) {
-                    return ActorResponse::reply(Ok(()));
-                }
-
-                let protocol = self.session_protocol.clone();
                 let fut = async move {
-                    if let Some(protocol) = protocol {
-                        protocol
-                            .send(SessionCmd::Disconnect(key.clone(), reason))
-                            .await??;
-                    }
-                    Ok(())
+                    let dht = dht.ok_or_else(|| Error::protocol("No discovery protocol"))?;
+                    let proto = proto.ok_or_else(|| Error::protocol("No session protocol"))?;
+                    let from_key = identities
+                        .get_key(&from)
+                        .ok_or_else(|| Error::protocol("Unknown identity"))?;
+
+                    let dht_value = actor
+                        .send(internal::ResolveIdentity::new(to.clone()))
+                        .await??;
+                    let packet = Self::process_outbound(
+                        processors,
+                        Some(&from_key),
+                        Some(&dht_value.identity_key),
+                        packet,
+                    )
+                    .await?;
+
+                    let slots = (to_slot(&from_key), to_slot(&dht_value.identity_key));
+                    let existing = { (*sessions.borrow()).get(&slots).cloned() };
+                    let mut session = match existing {
+                        Some(session) => session,
+                        _ => {
+                            let mut session = {
+                                sessions
+                                    .borrow_mut()
+                                    .entry(slots)
+                                    .or_insert(Session::new(
+                                        from_key.clone(),
+                                        dht_value.identity_key.clone(),
+                                    ))
+                                    .clone()
+                            };
+                            let addresses = dht
+                                .send(DhtCmd::ResolveNode(dht_value.node_key.clone()))
+                                .await??
+                                .into_addresses()?;
+                            let connections = actor.send(internal::Connect(addresses)).await??;
+                            session
+                                .add_future_connection(connections, |conn| {
+                                    proto
+                                        .send(SessionCmd::Initiate {
+                                            from: from_key.clone(),
+                                            from_identity: from.clone(),
+                                            to: dht_value.identity_key.clone(),
+                                            to_identity: to.clone(),
+                                            address: conn.address,
+                                        })
+                                        .map(|r| r.flatten_result())
+                                })
+                                .await?;
+                            session
+                        }
+                    };
+
+                    tokio::time::timeout(timeout, session)
+                        .await
+                        .map_err(|_| Error::from(SessionError::Timeout))??
+                        .send(packet)
+                        .await
+                        .map(|_| Ok(()))?
                 };
+
                 ActorResponse::r#async(fut.into_actor(self))
             }
+            SendCmd::Broadcast { packet } => unimplemented!(),
         }
     }
 }
 
 impl<Key> Handler<TransportEvt> for Net<Key>
 where
-    Key: Unpin + Send + Clone + Debug + Hash + Eq + 'static,
+    Key: Unpin + Send + Clone + Debug + Hash + Eq + AsRef<[u8]> + 'static,
 {
     type Result = ();
 
@@ -444,55 +428,72 @@ where
             }
             TransportEvt::Disconnected(address, reason) => {
                 log::debug!("Disconnected from {:?}: {:?}", address, reason);
-                if let Some(conn) = self.connections.disconnected(&address) {
-                    if let Some(key) = conn.ctx() {
-                        if let Some(session) = self.sessions.get_mut(&key) {
+                if let Some(mut conn) = self.connections.disconnected(&address) {
+                    let mut sessions = self.sessions.borrow_mut();
+                    conn.take_slots().into_iter().for_each(|pair| {
+                        if let Some(session) = sessions.get_mut(&pair) {
                             session.remove_connection(&conn);
                             if !session.is_alive() {
-                                self.sessions.remove(&key);
+                                sessions.remove(&pair);
                             }
                         }
-                    }
+                    });
                 }
             }
             TransportEvt::Packet(address, packet) => {
-                if packet.message.len() == 0 {
-                    log::trace!("Received an empty packet");
-                    return;
-                }
-
                 let packet = match packet.try_decode() {
                     Ok(packet) => packet,
-                    Err(err) => {
-                        log::warn!("Error decoding packet: {:?}", err);
-                        return;
-                    }
+                    Err(err) => return log::warn!("Error decoding packet: {:?}", err),
                 };
-                let key = self.connections.get(&address).map(|c| c.ctx()).flatten();
-                let protocol_id = packet.payload.protocol_id();
-                let protocol = match self.protocols.get(&protocol_id).cloned() {
-                    Some(protocol) => protocol,
-                    _ => {
-                        log::error!(
-                            "Unknown protocol {} (address: {:?}, key: {:?})",
-                            protocol_id,
-                            address,
-                            key
-                        );
-                        return;
-                    }
+                let proto_id = packet.payload.protocol_id;
+                let proto = match self.protocols.get(&proto_id) {
+                    Some(protocol) => protocol.clone(),
+                    _ => return log::error!("Unknown protocol {} ({:?})", proto_id, address),
                 };
+                let keys = packet
+                    .slots()
+                    .map(|(sender, recipient)| {
+                        self.sessions
+                            .borrow()
+                            .get(&(recipient, sender))
+                            .map(|s| s.keys())
+                    })
+                    .flatten();
 
-                let process_fut = self.process_inbound(key.clone(), None, packet);
+                let identities = self.identities.clone();
+                let processors = self.processors.clone();
                 let fut = async move {
-                    let packet = process_fut.await?;
-                    let command = match key {
-                        Some(key) => ProtocolCmd::SessionPacket(address, packet, key),
-                        None => ProtocolCmd::RoamingPacket(address, packet),
+                    let command = match keys {
+                        Some((local, remote)) => ProtocolCmd::SessionPacket {
+                            from: identities.get_identity(&remote).ok_or_else(|| {
+                                Error::protocol(format!(
+                                    "Unknown remote identity for key {}",
+                                    hex::encode(&remote)
+                                ))
+                            })?,
+                            to: identities.get_identity(&local).ok_or_else(|| {
+                                Error::protocol(format!(
+                                    "Unknown local identity for key {}",
+                                    hex::encode(&local)
+                                ))
+                            })?,
+                            address,
+                            packet: Self::process_inbound(
+                                processors,
+                                Some(&remote),
+                                Some(&local),
+                                packet,
+                            )
+                            .await?,
+                        },
+                        None => ProtocolCmd::RoamingPacket {
+                            address,
+                            packet: Self::process_inbound(processors, None, None, packet).await?,
+                        },
                     };
 
-                    log::debug!("Protocol {} message ({:?})", protocol_id, address,);
-                    protocol.send(command).await??;
+                    log::debug!("Protocol {} message ({:?})", proto_id, address);
+                    proto.send(command).await??;
                     Ok(())
                 }
                 .map_err(|e: Error| log::error!("Packet handler error: {}", e))
@@ -506,45 +507,42 @@ where
 
 impl<Key> Handler<SessionEvt<Key>> for Net<Key>
 where
-    Key: Unpin + Send + Clone + Debug + Hash + Eq + 'static,
+    Key: Unpin + Send + Clone + Debug + Hash + Eq + AsRef<[u8]> + 'static,
 {
     type Result = ();
 
-    fn handle(&mut self, evt: SessionEvt<Key>, _: &mut Context<Self>) -> Self::Result {
+    fn handle(&mut self, evt: SessionEvt<Key>, ctx: &mut Context<Self>) -> Self::Result {
         match evt {
-            SessionEvt::Established(address, key) => match self.connections.get(&address) {
+            SessionEvt::Established {
+                from,
+                from_identity,
+                to,
+                to_identity,
+                address,
+            } => match self.connections.get(&address) {
                 Some(conn) => {
                     self.sessions
-                        .entry(key.clone())
-                        .or_insert_with(|| Session::new(key))
+                        .borrow_mut()
+                        .entry((to_slot(&from), to_slot(&to)))
+                        .or_insert_with(|| Session::new(from, to.clone()))
                         .add_connection(conn.clone());
+                    self.identities.insert_key(to_identity, to);
                 }
                 _ => {
                     log::warn!(
-                        "Connection to {:?} (key: {:?}) no longer exists",
+                        "Connection to {:?} ({}) no longer exists",
                         address,
-                        key
+                        hex::encode(to.as_ref())
                     );
                 }
             },
-            SessionEvt::Disconnected(key) => {
-                match self.sessions.remove(&key) {
-                    Some(mut session) => {
-                        session.addresses().into_iter().for_each(|a| {
-                            self.connections.disconnected(&a);
-                        });
-                        session.terminate();
-                    }
-                    None => return,
-                };
-            }
         }
     }
 }
 
 impl<Key> Handler<GetStatus> for Net<Key>
 where
-    Key: Unpin + Send + Clone + Debug + Hash + Eq + 'static,
+    Key: Unpin + Send + Clone + Debug + Hash + Eq + AsRef<[u8]> + 'static,
 {
     type Result = Result<StatusInfo>;
 
@@ -554,36 +552,72 @@ where
     }
 }
 
-impl<Key> Handler<internal::Connect<Key>> for Net<Key>
+impl<Key> Handler<internal::ResolveIdentity<Key>> for Net<Key>
 where
-    Key: Unpin + Send + Clone + Debug + Hash + Eq + 'static,
+    Key: Unpin + Send + Clone + Debug + Hash + Eq + AsRef<[u8]> + 'static,
 {
-    type Result = <internal::Connect<Key> as Message>::Result;
+    type Result = ActorResponse<Self, DhtValue<Key>, Error>;
 
-    fn handle(&mut self, evt: internal::Connect<Key>, ctx: &mut Context<Self>) -> Self::Result {
+    fn handle(
+        &mut self,
+        evt: internal::ResolveIdentity<Key>,
+        ctx: &mut Context<Self>,
+    ) -> Self::Result {
+        if let Some(node_key) = self.identities.get_node_key(&evt.identity) {
+            if let Some(identity_key) = self.identities.get_key(&evt.identity) {
+                let dht_value = DhtValue {
+                    identity_key,
+                    node_key,
+                };
+                return ActorResponse::reply(Ok(dht_value));
+            }
+        }
+
+        let mut identities = self.identities.clone();
+        let dht = self.dht_protocol.clone();
+        let fut = async move {
+            let dht_value = dht
+                .ok_or_else(|| Error::protocol("No discovery protocol"))?
+                .send(DhtCmd::ResolveValue(evt.identity.as_ref().to_vec()))
+                .await??
+                .into_value()?;
+            identities.insert_key(evt.identity.clone(), dht_value.identity_key.clone());
+            identities.insert_node_key(evt.identity, dht_value.node_key.clone());
+            Ok(dht_value)
+        };
+
+        ActorResponse::r#async(fut.into_actor(self))
+    }
+}
+
+impl<Key> Handler<internal::Connect> for Net<Key>
+where
+    Key: Unpin + Send + Clone + Debug + Hash + Eq + AsRef<[u8]> + 'static,
+{
+    type Result = <internal::Connect as Message>::Result;
+
+    fn handle(&mut self, evt: internal::Connect, ctx: &mut Context<Self>) -> Self::Result {
         let mut addresses = Vec::new();
         let mut triggers = Vec::new();
         let mut futs = Vec::new();
 
-        evt.addresses
-            .into_iter()
-            .for_each(|addr| match addr.transport_id {
-                Address::ANY_TRANSPORT => addresses.extend(
-                    self.transports
-                        .keys()
-                        .map(|id| Address::new(*id, addr.socket_addr)),
-                ),
-                _ => addresses.push(addr),
-            });
+        evt.0.into_iter().for_each(|a| match a.transport_id {
+            Address::ANY_TRANSPORT => addresses.extend(
+                self.transports
+                    .keys()
+                    .map(|id| Address::new(*id, a.socket_addr)),
+            ),
+            _ => addresses.push(a),
+        });
 
         log::debug!("Connecting to addresses: {:?}", addresses);
 
-        addresses.into_iter().for_each(|address| {
-            if let Some(recipient) = self.transports.get(&address.transport_id) {
-                let pending = self.connections.pending(address);
+        addresses.into_iter().for_each(|a| {
+            if let Some(recipient) = self.transports.get(&a.transport_id) {
+                let pending = self.connections.pending(a);
                 if let PendingConnection::New(_) = &pending {
-                    log::debug!("Connecting to {:?}", address);
-                    futs.push(recipient.send(TransportCmd::Connect(address.socket_addr)));
+                    log::debug!("Connecting to {:?}", a);
+                    futs.push(recipient.send(TransportCmd::Connect(a.socket_addr)));
                 }
                 triggers.push(pending.into());
             };
@@ -601,35 +635,33 @@ where
     }
 }
 
-impl<Key> Handler<internal::Send<Key>> for Net<Key>
+impl<Key> Handler<internal::AddTransport> for Net<Key>
 where
-    Key: Unpin + Send + Clone + Debug + Hash + Eq + 'static,
+    Key: Unpin + Send + Clone + Debug + Hash + Eq + AsRef<[u8]> + 'static,
 {
-    type Result = ActorResponse<Self, (), Error>;
+    type Result = <internal::AddTransport as actix::Message>::Result;
 
-    fn handle(&mut self, evt: internal::Send<Key>, ctx: &mut Context<Self>) -> Self::Result {
-        let session_fut = self.session(evt.to.clone(), ctx.address());
-        let process_fut = self.process_outbound(evt.from, Some(evt.to), evt.packet);
-        let timeout = self.conf.session_timeout;
+    fn handle(&mut self, evt: internal::AddTransport, _: &mut Context<Self>) -> Self::Result {
+        let (transport_id, recipient) = (evt.0, evt.1);
+        self.transports.insert(transport_id, recipient);
+    }
+}
 
-        ActorResponse::r#async(
-            async move {
-                let packet = process_fut.await?;
-                tokio::time::timeout(timeout, session_fut)
-                    .await
-                    .map_err(|_| Error::from(SessionError::Timeout))??
-                    .send(packet)
-                    .await
-                    .map(|_| Ok(()))?
-            }
-            .into_actor(self),
-        )
+impl<Key> Handler<internal::RemoveTransport> for Net<Key>
+where
+    Key: Unpin + Send + Clone + Debug + Hash + Eq + AsRef<[u8]> + 'static,
+{
+    type Result = <internal::RemoveTransport as actix::Message>::Result;
+
+    fn handle(&mut self, evt: internal::RemoveTransport, _: &mut Context<Self>) -> Self::Result {
+        let transport_id = evt.0;
+        self.transports.remove(&transport_id);
     }
 }
 
 impl<Key> NetAddrExt<Key> for Addr<Net<Key>>
 where
-    Key: Unpin + Send + Clone + Debug + Hash + Eq + 'static,
+    Key: Unpin + Send + Clone + Debug + Hash + Eq + AsRef<[u8]> + 'static,
 {
     fn add_processor<A>(&self, actor: A) -> Recipient<ProcessCmd<Key>>
     where
@@ -651,24 +683,25 @@ where
         }
     }
 
-    fn add_protocol<A>(&self, actor: A) -> Recipient<ProtocolCmd<Key>>
+    fn add_protocol<A>(&self, actor: A) -> Recipient<ProtocolCmd>
     where
-        A: Protocol<Key>,
+        A: Protocol,
     {
         let recipient = actor.start().recipient();
-        self.do_send(ServiceCmd::AddProtocol(A::PROTOCOL_ID, recipient.clone()));
+        self.do_send(ServiceCmd::AddProtocol(A::ID, recipient.clone()));
         recipient
     }
 
     fn set_dht<A>(&self, actor: A) -> Addr<A>
     where
-        A: Protocol<Key> + Handler<DhtCmd<Key>>,
+        A: Protocol + Handler<DhtCmd<Key>>,
     {
         {
             let addr = actor.start();
             self.do_send(ServiceCmd::SetDhtProtocol(addr.clone().recipient()));
+            self.do_send(ServiceCmd::AddProtocol(A::ID, addr.clone().recipient()));
             self.do_send(ServiceCmd::AddProtocol(
-                A::PROTOCOL_ID,
+                A::ID,
                 addr.clone().recipient(),
             ));
             addr
@@ -677,53 +710,24 @@ where
 
     fn set_session<A>(&self, actor: A) -> Recipient<SessionCmd<Key>>
     where
-        A: Protocol<Key> + Handler<SessionCmd<Key>>,
+        A: Protocol + Handler<SessionCmd<Key>>,
     {
         {
             let addr = actor.start();
             self.do_send(ServiceCmd::SetSessionProtocol(addr.clone().recipient()));
-            self.do_send(ServiceCmd::AddProtocol(
-                A::PROTOCOL_ID,
-                addr.clone().recipient(),
-            ));
+            self.do_send(ServiceCmd::AddProtocol(A::ID, addr.clone().recipient()));
             addr.recipient()
         }
     }
 }
 
-macro_rules! impl_internal_handler {
-    ($msg:ty, ($self:ident, $evt:ident, $ctx:ident) $impl:block) => {
-        impl<Key> Handler<$msg> for Net<Key>
-        where
-            Key: Unpin + Send + Clone + Debug + Hash + Eq + 'static,
-        {
-            type Result = <$msg as actix::Message>::Result;
-
-            fn handle(&mut $self, $evt: $msg, $ctx: &mut Context<Self>) -> Self::Result $impl
-        }
-    };
-}
-
-impl_internal_handler!(internal::Shutdown, (self, _evt, ctx) {
-    ctx.stop();
-});
-
-impl_internal_handler!(internal::AddTransport, (self, evt, _ctx) {
-    let (transport_id, recipient) = (evt.0, evt.1);
-    self.transports.insert(transport_id, recipient);
-});
-
-impl_internal_handler!(internal::RemoveTransport, (self, evt, _ctx) {
-    let transport_id = evt.0;
-    self.transports.remove(&transport_id);
-});
-
 mod internal {
-    use crate::event::TransportCmd;
+    use crate::event::{DhtValue, TransportCmd};
+    use crate::identity::Identity;
     use crate::packet::Packet;
     use crate::transport::connection::ConnectionFut;
-    use crate::transport::Address;
-    use crate::{Result, TransportId};
+    use crate::transport::{Address, TransportId};
+    use crate::Result;
     use actix::prelude::*;
     use serde::export::PhantomData;
     use std::fmt::Debug;
@@ -737,30 +741,22 @@ mod internal {
     pub struct RemoveTransport(pub TransportId);
 
     #[derive(Clone, Debug, Message)]
-    #[rtype(result = "()")]
-    pub struct Shutdown;
-
-    #[derive(Clone, Debug, Message)]
-    #[rtype(result = "Result<Vec<ConnectionFut<Key>>>")]
-    pub struct Connect<Key: Clone + Debug + 'static> {
-        pub addresses: Vec<Address>,
+    #[rtype(result = "Result<DhtValue<Key>>")]
+    pub struct ResolveIdentity<Key: Clone + Debug + 'static> {
+        pub identity: Identity,
         phantom: PhantomData<Key>,
     }
 
-    impl<Key: Clone + Debug + 'static> Connect<Key> {
-        pub fn new(addresses: Vec<Address>) -> Self {
-            Connect {
-                addresses,
+    impl<Key: Clone + Debug + 'static> ResolveIdentity<Key> {
+        pub fn new(identity: Identity) -> Self {
+            ResolveIdentity {
+                identity,
                 phantom: PhantomData,
             }
         }
     }
 
     #[derive(Clone, Debug, Message)]
-    #[rtype(result = "Result<()>")]
-    pub struct Send<Key: Clone + Debug + 'static> {
-        pub from: Option<Key>,
-        pub to: Key,
-        pub packet: Packet,
-    }
+    #[rtype(result = "Result<Vec<ConnectionFut>>")]
+    pub struct Connect(pub Vec<Address>);
 }

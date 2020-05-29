@@ -255,8 +255,12 @@ where
             }
             SocketEvent::Packet(packet) => {
                 let packet = AddressedPacket::from(packet);
-                log::trace!("Laminar: packet from {:?}", packet.address);
+                if packet.encoded.message.len() == 0 {
+                    log::trace!("Laminar: received an empty packet");
+                    return ActorResponse::reply(Ok(()));
+                }
 
+                log::trace!("Laminar: packet from {:?}", packet.address);
                 ActorResponse::r#async(
                     self.recipient
                         .clone()

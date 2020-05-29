@@ -7,7 +7,6 @@ use std::collections::HashMap;
 #[derive(Message)]
 #[rtype(result = "Result<KadStatus>")]
 pub struct QueryKadStatus {
-    query_stats: bool,
     query_dht: bool,
 }
 
@@ -15,7 +14,6 @@ impl Default for QueryKadStatus {
     fn default() -> Self {
         QueryKadStatus {
             query_dht: false,
-            query_stats: true,
         }
     }
 }

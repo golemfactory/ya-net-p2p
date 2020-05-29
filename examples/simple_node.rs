@@ -17,7 +17,8 @@ use ya_net_p2p::packet::CryptoProcessor;
 use ya_net_p2p::protocol::kad::{KadProtocol, NodeDataExt};
 use ya_net_p2p::protocol::session::SessionProtocol;
 use ya_net_p2p::transport::laminar::LaminarTransport;
-use ya_net_p2p::{Address, GetStatus, Net, NetAddrExt};
+use ya_net_p2p::{transport::Address, GetStatus, Net, NetAddrExt, Identity};
+use ya_net_p2p::identity::IdentityManager;
 
 type KeySize = U20;
 type Key = ya_net_kad::Key<KeySize>;
@@ -118,22 +119,30 @@ async fn main() -> anyhow::Result<()> {
     log::info!("Spawning node");
     let socket_addr = args.net_addr;
     let socket_addrs = vec![socket_addr];
-    let id_bytes = rand::thread_rng().gen::<[u8; 20]>();
-    let id: Key = if let Some(key) = &args.id {
-        Key::try_from(hex::decode(key)?)?
-    } else {
-        Key::new(id_bytes)
+    let mut id_bytes = rand::thread_rng().gen::<[u8; 20]>().to_vec();
+    if let Some(key) = &args.id {
+        id_bytes = hex::decode(key)?;
     };
+
+    let identity = Identity::new(&id_bytes);
+    let identity_manager = IdentityManager::<Key>::from_raw(
+        identity.clone(),
+        id_bytes.clone(),
+        id_bytes.clone(),
+        id_bytes.clone(),
+    )?;
+    let node_key = identity_manager.get_node_key(&identity).unwrap();
     let node = Node {
-        key: id.clone(),
+        key: node_key.clone(),
         data: NodeDataExample::from_address(Address::new(Address::LAMINAR, socket_addr)),
     };
-    let net = Net::new(socket_addrs).start();
+
+    let net = Net::new(socket_addrs, identity_manager.clone()).start();
     let dht: Addr<KadProtocol<KeySize, NodeDataExample>> =
         net.set_dht(KadProtocol::new(node.clone(), &net));
     let _ = dht.send(QueryKadStatus::default());
-    net.set_session(SessionProtocol::new(&net, &net));
-    net.add_processor(CryptoProcessor::new(id.clone(), no_crypto()));
+    net.set_session(SessionProtocol::new(&identity_manager,&net, &net));
+    net.add_processor(CryptoProcessor::new(&identity_manager, no_crypto()));
     net.add_transport(LaminarTransport::<Key>::new(&net));
     log::info!("Node key: {}", hex::encode(&node.key));
     log::info!("Node addresses: {:?}", node.data.addresses());

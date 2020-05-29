@@ -17,6 +17,7 @@ pub trait KeyLen: ArrayLength<u8> + Debug + Unpin + Clone + Ord + Hash {}
 impl<N> KeyLen for N where N: ArrayLength<u8> + Debug + Unpin + Clone + Ord + Hash {}
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Deserialize, Serialize)]
+#[serde(bound = "N: ArrayLength<u8>")]
 pub struct Key<N: KeyLen> {
     inner: GenericArray<u8, N>,
 }

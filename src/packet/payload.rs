@@ -1,155 +1,137 @@
 use crate::crypto::{Signature, SignatureECDSA};
 use crate::error::MessageError;
+use crate::identity::{Identity, Slot};
 use crate::packet::codec::Codec;
-use crate::packet::header::*;
-use crate::protocol::ProtocolId;
-use crate::Result;
+use crate::protocol::{ProtocolId, ProtocolVersion};
+use crate::{Error, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::mem;
+use std::mem::size_of;
 use tokio_bytes::{Buf, BufMut, Bytes, BytesMut};
 
 #[derive(Clone, Debug)]
 pub struct Payload {
-    pilot_header: PilotHeader,
-    relay_header: Option<BytesPayload>,
-    payload: BytesPayload,
+    pub protocol_id: ProtocolId,
+    pub protocol_ver: ProtocolVersion,
+    flags: u8,
+    pub sender: Option<Slot>,
+    pub recipient: Option<Slot>,
     pub signature: Option<Signature>,
+    pub body: Body,
 }
 
 impl Payload {
-    #[inline]
-    pub fn new(protocol_id: ProtocolId) -> Self {
+    pub const FLAG_SIGNATURE: u8 = 0b_0000_0001;
+    pub const FLAG_ENCRYPTION: u8 = 0b_0000_0010;
+
+    pub fn new(protocol_id: ProtocolId, protocol_ver: ProtocolVersion, payload: Vec<u8>) -> Self {
         Payload {
-            pilot_header: PilotHeader::from(protocol_id),
-            relay_header: None,
-            payload: BytesPayload::default(),
+            protocol_id,
+            protocol_ver,
+            flags: 0,
+            sender: None,
+            recipient: None,
             signature: None,
+            body: Body::from(payload),
         }
     }
 
-    fn update_payload_offset(&mut self) {
-        let mut payload_offset = mem::size_of::<PilotHeader>();
-        if let Some(header) = &self.relay_header {
-            payload_offset += header.size();
-        }
-        self.pilot_header.payload_offset = payload_offset as u16;
+    pub fn try_with<P: Serialize>(
+        protocol_id: ProtocolId,
+        protocol_ver: ProtocolVersion,
+        payload: &P,
+    ) -> Result<Self> {
+        Ok(Self::new(
+            protocol_id,
+            protocol_ver,
+            crate::serialize::to_vec(payload)?,
+        ))
+    }
+
+    pub fn decode_body<D: DeserializeOwned>(&self) -> Result<D> {
+        let deserialized = crate::serialize::from_read(self.body.as_ref())?;
+        Ok(deserialized)
     }
 }
 
 impl Payload {
-    #[inline]
-    pub fn is_relayed(&self) -> bool {
-        self.pilot_header.is_relayed()
-    }
-
     #[inline]
     pub fn is_signed(&self) -> bool {
-        self.pilot_header.is_signed()
+        self.flags & Self::FLAG_SIGNATURE == Self::FLAG_SIGNATURE
+    }
+
+    pub fn sign(mut self) -> Self {
+        self.flags |= Self::FLAG_SIGNATURE;
+        self
     }
 
     #[inline]
     pub fn is_encrypted(&self) -> bool {
-        self.pilot_header.is_encrypted()
-    }
-}
-
-impl Payload {
-    #[inline]
-    pub fn protocol_id(&self) -> ProtocolId {
-        self.pilot_header.protocol_id
+        self.flags & Self::FLAG_ENCRYPTION == Self::FLAG_ENCRYPTION
     }
 
     #[inline]
-    pub fn relay(&self) -> Option<&Vec<u8>> {
-        self.relay_header.as_ref().map(|h| h.vec())
+    pub fn encrypt(mut self) -> Self {
+        self.flags |= Self::FLAG_ENCRYPTION;
+        self
     }
 
     #[inline]
-    pub fn signature(&mut self) -> Option<&mut Signature> {
-        self.signature.as_mut()
-    }
-
-    #[inline]
-    pub fn payload(&self) -> &BytesPayload {
-        &self.payload
-    }
-
-    pub fn decode_payload<D: DeserializeOwned>(&self) -> Result<D> {
-        let deserialized = crate::serialize::from_read(self.payload.vec().as_slice())?;
-        Ok(deserialized)
-    }
-
-    pub fn signature_data(&self) -> Vec<u8> {
+    pub fn encode_for_signing(&self) -> Vec<u8> {
         let mut cloned = self.clone();
         cloned.signature = None;
         cloned.encode_vec()
     }
 }
 
-impl Payload {
-    #[inline]
-    pub fn with_relaying(mut self, to: Vec<u8>) -> Self {
-        self.pilot_header.header_flags |= PilotHeader::FLAG_RELAY;
-        self.relay_header = Some(BytesPayload::from(to));
-        self
-    }
-
-    #[inline]
-    pub fn with_signature(mut self) -> Self {
-        self.pilot_header.header_flags |= PilotHeader::FLAG_SIGNATURE;
-        self
-    }
-
-    #[inline]
-    pub fn with_encryption(mut self) -> Self {
-        self.pilot_header.header_flags |= PilotHeader::FLAG_ENCRYPTION;
-        self
-    }
-
-    #[inline]
-    pub fn with_payload(mut self, vec: Vec<u8>) -> Self {
-        self.payload = BytesPayload::from(vec);
-        self
-    }
-
-    pub fn encode_payload<P: Serialize>(mut self, payload: &P) -> Result<Self> {
-        self.payload = BytesPayload::from(crate::serialize::to_vec(payload)?);
-        Ok(self)
-    }
-}
-
 impl Codec for Payload {
     fn encode(&mut self, bytes: &mut BytesMut) {
-        self.update_payload_offset();
+        bytes.put_uint(self.protocol_id as u64, size_of::<ProtocolId>());
+        bytes.put_uint(self.protocol_ver as u64, size_of::<ProtocolVersion>());
+        bytes.put_u8(self.flags);
 
-        self.pilot_header.encode(bytes);
-        if let Some(header) = &mut self.relay_header {
-            header.encode(bytes);
+        if self.flags & Self::FLAG_ENCRYPTION == Self::FLAG_ENCRYPTION {
+            bytes.put_uint(self.sender.unwrap() as u64, size_of::<Slot>());
+            bytes.put_uint(self.recipient.unwrap() as u64, size_of::<Slot>());
         }
-        self.payload.encode(bytes);
-        if let Some(signature) = &mut self.signature {
-            signature.encode(bytes);
+        if self.flags & Self::FLAG_SIGNATURE == Self::FLAG_SIGNATURE {
+            if let Some(signature) = &mut self.signature {
+                signature.encode(bytes);
+            }
         }
+
+        self.body.encode(bytes);
     }
 
     fn decode(bytes: &mut Bytes) -> Result<Self> {
-        let pilot_header = PilotHeader::decode(bytes)?;
-        let relay_header = match pilot_header.is_relayed() {
-            true => Some(BytesPayload::decode(bytes)?),
-            false => None,
+        let protocol_id = bytes.get_uint(size_of::<ProtocolId>()) as ProtocolId;
+        let protocol_ver = bytes.get_uint(size_of::<ProtocolVersion>()) as ProtocolVersion;
+        let flags = bytes.get_u8();
+
+        let (sender, recipient) = if flags & Self::FLAG_ENCRYPTION == Self::FLAG_ENCRYPTION {
+            let sender = bytes.get_uint(size_of::<Slot>()) as Slot;
+            let recipient = bytes.get_uint(size_of::<Slot>()) as Slot;
+            (Some(sender), Some(recipient))
+        } else {
+            (None, None)
         };
-        let payload = BytesPayload::decode(bytes)?;
-        let signature = match pilot_header.is_signed() {
-            true => Some(Signature::decode(bytes)?),
-            false => None,
+        let signature = if flags & Self::FLAG_SIGNATURE == Self::FLAG_SIGNATURE {
+            Some(Signature::decode(bytes)?)
+        } else {
+            None
         };
 
+        let body = Body::decode(bytes)?;
+
         Ok(Payload {
-            pilot_header,
-            relay_header,
-            payload,
+            protocol_id,
+            protocol_ver,
+            flags,
+            sender,
+            recipient,
             signature,
+            body,
         })
     }
 }
@@ -163,7 +145,7 @@ impl Codec for Signature {
             }
             Signature::Plain(key) => {
                 bytes.put_u8(1u8);
-                BytesPayload::encode_with_vec(&key, bytes);
+                Body::encode_with_vec(&key, bytes);
             }
         }
     }
@@ -172,7 +154,7 @@ impl Codec for Signature {
         let marker = bytes.get_u8();
         match marker {
             0u8 => Ok(Signature::ECDSA(SignatureECDSA::decode(bytes)?)),
-            1u8 => Ok(Signature::Plain(BytesPayload::decode_to_vec(bytes)?)),
+            1u8 => Ok(Signature::Plain(Body::decode_to_vec(bytes)?)),
             _ => Err(MessageError::UnsupportedSignature.into()),
         }
     }
@@ -183,7 +165,7 @@ impl Codec for SignatureECDSA {
         match self {
             SignatureECDSA::P256K1 { data, key: _ } => {
                 bytes.put_u8(0u8);
-                BytesPayload::encode_with_vec(data, bytes)
+                Body::encode_with_vec(data, bytes)
             }
         }
     }
@@ -193,7 +175,7 @@ impl Codec for SignatureECDSA {
 
         match marker {
             0u8 => Ok(SignatureECDSA::P256K1 {
-                data: BytesPayload::decode_to_vec(bytes)?,
+                data: Body::decode_to_vec(bytes)?,
                 key: None,
             }),
             _ => Err(MessageError::UnsupportedSignature.into()),
@@ -201,22 +183,91 @@ impl Codec for SignatureECDSA {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Body {
+    vec: Vec<u8>,
+}
+
+impl Body {
+    #[inline]
+    pub fn take(&mut self) -> Vec<u8> {
+        std::mem::replace(&mut self.vec, Vec::new())
+    }
+
+    #[inline]
+    pub fn encode_with_vec(vec: &Vec<u8>, bytes: &mut BytesMut) {
+        bytes.put_u32(vec.len() as u32);
+        bytes.put(vec.as_slice());
+    }
+
+    #[inline]
+    pub fn decode_to_vec(bytes: &mut Bytes) -> Result<Vec<u8>> {
+        Self::decode(bytes).map(|b| b.vec)
+    }
+}
+
+impl Default for Body {
+    fn default() -> Self {
+        Body::from(Vec::new())
+    }
+}
+
+impl AsRef<[u8]> for Body {
+    fn as_ref(&self) -> &[u8] {
+        self.vec.as_ref()
+    }
+}
+
+impl From<Vec<u8>> for Body {
+    #[inline]
+    fn from(mut vec: Vec<u8>) -> Self {
+        let len = vec.len() as u32;
+        vec.truncate(len as usize);
+        Body { vec }
+    }
+}
+
+impl Codec for Body {
+    #[inline]
+    fn encode(&mut self, bytes: &mut BytesMut) {
+        Self::encode_with_vec(&self.vec, bytes)
+    }
+
+    fn decode(bytes: &mut Bytes) -> Result<Self> {
+        if bytes.remaining() < size_of::<u32>() {
+            return Err(insufficient_bytes());
+        }
+
+        let len = bytes.get_u32() as usize;
+        match bytes.remaining() < len {
+            true => Err(insufficient_bytes()),
+            false => {
+                let vec = bytes.split_to(len).to_vec();
+                Ok(Body { vec })
+            }
+        }
+    }
+}
+
+#[inline]
+pub fn insufficient_bytes() -> Error {
+    MessageError::Codec("insufficient bytes".to_string()).into()
+}
+
 #[cfg(test)]
 mod test {
     use super::Payload;
     use crate::crypto::{Signature, SignatureECDSA};
     use crate::packet::codec::Codec;
-    use crate::packet::header::PilotHeader;
-    use crate::protocol::ProtocolId;
+    use crate::protocol::{ProtocolId, ProtocolVersion};
 
     #[test]
     fn deserialize() {
         let protocol_id = 12345 as ProtocolId;
-        let mut payload = Payload::new(protocol_id)
-            .with_relaying([1u8; 32].to_vec())
-            .with_payload([2u8; 29].to_vec());
+        let protocol_ver = 0 as ProtocolVersion;
+        let mut payload = Payload::new(protocol_id, protocol_ver, [1u8; 29].to_vec());
 
-        payload.pilot_header.header_flags |= PilotHeader::FLAG_SIGNATURE;
+        payload.flags |= Payload::FLAG_SIGNATURE;
         payload.signature = Some(Signature::ECDSA(SignatureECDSA::P256K1 {
             data: [3u8; 32].to_vec(),
             key: None,
@@ -229,10 +280,7 @@ mod test {
     #[test]
     fn plain_sig() {
         let protocol_id = 12345 as ProtocolId;
-        let mut payload = Payload::new(protocol_id)
-            .with_relaying([1u8; 32].to_vec())
-            .with_payload([2u8; 29].to_vec())
-            .with_signature();
+        let mut payload = Payload::new(protocol_id, 0, [2u8; 29].to_vec());
         payload.signature = Some(Signature::Plain(vec![3u8; 20]));
         let mut decoded = Payload::decode_vec(payload.encode_vec()).unwrap();
         assert_eq!(payload.encode_vec(), decoded.encode_vec());

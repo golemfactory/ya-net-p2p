@@ -1,33 +1,34 @@
 use crate::error::Error;
-use crate::Result;
+use crate::identity::Slot;
+use crate::{Identity, Result};
 use futures::future::LocalBoxFuture;
 use serde::{Deserialize, Serialize};
 
+pub mod aes;
 mod nocrypto;
 
 pub use nocrypto::no_crypto;
 
-pub trait Crypto<Key>: Unpin {
-    fn encrypt<'a, P: AsRef<[u8]>>(
-        &self,
-        key: &Key,
-        payload: P,
+pub trait Crypto: Clone + Unpin {
+    fn derive_keys<'a>(
+        &mut self,
+        identity: &Identity,
+    ) -> LocalBoxFuture<'a, Result<(Vec<u8>, Vec<u8>)>>;
+
+    fn derive_shared_secret<'a>(
+        &mut self,
+        remote_key: &[u8],
+        local_secret_key: &[u8],
     ) -> LocalBoxFuture<'a, Result<Vec<u8>>>;
 
-    fn decrypt<'a, P: AsRef<[u8]>>(
-        &self,
-        key: &Key,
-        payload: P,
-    ) -> LocalBoxFuture<'a, Result<Vec<u8>>>;
+    fn encrypt(&self, key: &[u8], payload: &[u8]) -> Result<Vec<u8>>;
 
-    fn sign<'a>(&self, key: &Key, hash: Vec<u8>) -> LocalBoxFuture<'a, Result<Signature>>;
+    fn decrypt(&self, secret_key: &[u8], payload: &[u8]) -> Result<Vec<u8>>;
 
-    fn verify<H: AsRef<[u8]>>(
-        &self,
-        key: Option<&Key>,
-        signature: &mut Signature,
-        hash: H,
-    ) -> Result<bool>;
+    fn sign<'a>(&self, secret_key: &[u8], payload: &[u8]) -> LocalBoxFuture<'a, Result<Signature>>;
+
+    fn verify(&self, key: Option<&[u8]>, signature: &mut Signature, payload: &[u8])
+        -> Result<bool>;
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -51,6 +52,15 @@ impl Signature {
         }
     }
 
+    pub fn set_data(&mut self, vec: Vec<u8>) {
+        match self {
+            Signature::ECDSA(ecdsa) => ecdsa.set_data(vec),
+            Signature::Plain(data) => {
+                unimplemented!()
+            },
+        }
+    }
+
     pub fn key(&self) -> Option<Vec<u8>> {
         match self {
             Signature::Plain(key) => Some(key.clone()),
@@ -70,6 +80,12 @@ impl SignatureECDSA {
     pub fn data(&self) -> &Vec<u8> {
         match self {
             SignatureECDSA::P256K1 { data, key: _ } => &data,
+        }
+    }
+
+    pub fn set_data(&mut self, vec: Vec<u8>) {
+        match self {
+            SignatureECDSA::P256K1 { data, key: _ } => *data = vec,
         }
     }
 

@@ -1,8 +1,9 @@
 use crate::common::{FlattenResult, TriggerFut};
 use crate::error::{CryptoError, DiscoveryError, Error, ProtocolError, SessionError};
-use crate::event::{DhtCmd, DhtResponse, ProtocolCmd, SendCmd};
+use crate::event::{ProtocolCmd, SendCmd};
+use crate::identity::Identity;
 use crate::packet::{Guarantees, Packet, Payload};
-use crate::protocol::{Protocol, ProtocolId};
+use crate::protocol::{Protocol, ProtocolId, ProtocolVersion};
 use crate::serialize::{from_read as deser, to_vec as ser};
 use crate::transport::Address;
 use actix::prelude::*;
@@ -21,10 +22,11 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::SeqCst;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
-use ya_service_bus::untyped::{send as router_send, subscribe, RawHandler};
+use ya_service_bus::untyped::{subscribe, RawHandler};
 use ya_service_bus::{Handle, RpcRawCall};
 
 static CALL_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+type RequestFut = TriggerFut<Result<Vec<u8>, Error>>;
 
 impl From<Error> for ya_service_bus::Error {
     fn from(err: Error) -> Self {
@@ -52,119 +54,102 @@ impl Default for ProtocolConfig {
 
 pub struct ServiceBusProtocol<Key>
 where
-    Key: Hash + Eq + Clone + Debug + Unpin + Send + TryFrom<Vec<u8>> + 'static,
+    Key: Send + 'static,
 {
     conf: ProtocolConfig,
     net: Recipient<SendCmd<Key>>,
-    dht: Recipient<DhtCmd<Key>>,
-    requests: HashMap<usize, TriggerFut<Result<Vec<u8>, Error>>>,
+    requests: RequestMap,
     handle: Option<Handle>,
-}
-
-impl<Key> Protocol<Key> for ServiceBusProtocol<Key>
-where
-    Key: Hash + Eq + Clone + Debug + Unpin + Send + TryFrom<Vec<u8>> + 'static,
-{
-    const PROTOCOL_ID: ProtocolId = 1002;
 }
 
 impl<Key> ServiceBusProtocol<Key>
 where
     Key: Hash + Eq + Clone + Debug + Unpin + Send + TryFrom<Vec<u8>> + 'static,
 {
-    pub fn new<R, D>(net: &R, dht: &D) -> Self
+    pub fn new<R>(net: &R) -> Self
     where
         R: Into<Recipient<SendCmd<Key>>> + Clone,
-        D: Into<Recipient<DhtCmd<Key>>> + Clone,
     {
-        Self::with_config(net, dht, ProtocolConfig::default())
+        Self::with_config(net, ProtocolConfig::default())
     }
 
-    pub fn with_config<R, D>(net: &R, dht: &D, conf: ProtocolConfig) -> Self
+    pub fn with_config<R>(net: &R, conf: ProtocolConfig) -> Self
     where
         R: Into<Recipient<SendCmd<Key>>> + Clone,
-        D: Into<Recipient<DhtCmd<Key>>> + Clone,
     {
         Self {
             conf,
             net: net.clone().into(),
-            dht: dht.clone().into(),
-            requests: HashMap::default(),
+            requests: RequestMap::default(),
             handle: None,
         }
     }
 
     fn upkeep(&mut self, _: &mut Context<Self>) {
-        self.requests.retain(|_, t| t.is_pending());
+        self.requests.remove_finished()
     }
+}
+
+impl<Key> Protocol for ServiceBusProtocol<Key>
+where
+    Key: Hash + Eq + Clone + Debug + Unpin + Send + TryFrom<Vec<u8>> + 'static,
+{
+    const ID: ProtocolId = 8005;
+    const VERSION: ProtocolVersion = 0;
 }
 
 impl<Key> ServiceBusProtocol<Key>
 where
     Key: Hash + Eq + Clone + Debug + Unpin + Send + TryFrom<Vec<u8>> + 'static,
 {
-    fn build_request(request_id: usize, msg: Unicast<Key>) -> Result<SendCmd<Key>, Error> {
-        let packet = Packet {
-            guarantees: Guarantees::unordered(),
-            payload: Payload::new(Self::PROTOCOL_ID).encode_payload(&NetRpcMessage::Request {
-                request_id,
-                caller: msg.caller,
-                callee: msg.callee,
-                addr: msg.addr,
-                body: msg.body,
-            })?,
-        };
-
-        Ok(SendCmd::Session {
-            from: None,
-            to: msg.node_key,
-            packet,
-        })
-    }
-
-    fn build_response(to: Key, request_id: usize, body: Vec<u8>) -> Result<SendCmd<Key>, Error> {
-        let packet = Packet {
-            guarantees: Guarantees::unordered(),
-            payload: Payload::new(Self::PROTOCOL_ID)
-                .encode_payload(&NetRpcMessage::Response { request_id, body })?,
-        };
-
-        Ok(SendCmd::Session {
-            from: None,
-            to,
-            packet,
-        })
-    }
-
     fn handle_rpc_message<'a>(
         &mut self,
-        key: Key,
-        msg: NetRpcMessage,
+        from: Identity,
+        to: Identity,
+        packet: Packet,
     ) -> LocalBoxFuture<'a, Result<(), Error>> {
+        let msg: internal::Message = match packet.payload.decode_body() {
+            Ok(msg) => msg,
+            Err(err) => return futures::future::err(err).boxed_local(),
+        };
+
         match msg {
-            NetRpcMessage::Request {
+            internal::Message::Request {
                 request_id,
-                caller,
-                callee: _,
                 addr,
                 body,
             } => {
                 let net = self.net.clone();
                 async move {
-                    let response = router_send(addr.as_str(), caller.as_str(), body.as_slice())
-                        .map_err(|e| e.to_string())
-                        .await;
-
-                    let payload = ser(&response)?;
-                    net.send(Self::build_response(key, request_id, payload)?)
-                        .await??;
+                    let result = router_send(addr, from.to_string(), body)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let msg = internal::Message::Response {
+                        request_id,
+                        body: ser(&result)?,
+                    };
+                    let response = SendCmd::Session {
+                        from: to,
+                        to: from,
+                        packet: Packet::try_unordered::<Self, _>(&msg)?,
+                    };
+                    net.send(response).await??;
                     Ok(())
                 }
                 .boxed_local()
             }
-            NetRpcMessage::Response { request_id, body } => {
-                match self.requests.remove(&request_id) {
-                    Some(mut request) => request.ready(Ok(body)),
+            internal::Message::Response { request_id, body } => {
+                match self.requests.get_mut(&request_id) {
+                    Some((callee, trigger)) => {
+                        if *callee != from {
+                            return futures::future::err(Error::protocol(
+                                "invalid callee in rpc response",
+                            ))
+                            .boxed_local();
+                        }
+                        trigger.ready(Ok(body));
+                        self.requests.remove(&request_id);
+                    }
                     None => log::warn!("Unknown request id: {}", request_id),
                 }
                 futures::future::ok(()).boxed_local()
@@ -189,7 +174,6 @@ where
             ServiceBusHandler {
                 proto: ctx.address(),
                 net: self.net.clone(),
-                dht: self.dht.clone(),
             },
         ));
 
@@ -201,23 +185,27 @@ where
     }
 }
 
-impl<Key> Handler<ProtocolCmd<Key>> for ServiceBusProtocol<Key>
+impl<Key> Handler<ProtocolCmd> for ServiceBusProtocol<Key>
 where
     Key: Hash + Eq + Clone + Debug + Unpin + Send + TryFrom<Vec<u8>> + 'static,
 {
     type Result = ActorResponse<Self, (), Error>;
 
-    fn handle(&mut self, msg: ProtocolCmd<Key>, ctx: &mut Context<Self>) -> Self::Result {
+    fn handle(&mut self, msg: ProtocolCmd, ctx: &mut Context<Self>) -> Self::Result {
         match msg {
-            ProtocolCmd::SessionPacket(_, packet, key) => {
-                let msg: NetRpcMessage = match packet.payload.decode_payload() {
-                    Ok(msg) => msg,
-                    Err(err) => return ActorResponse::reply(Err(err.into())),
-                };
-                let fut = self.handle_rpc_message(key, msg);
+            ProtocolCmd::SessionPacket {
+                from,
+                to,
+                address,
+                packet,
+            } => {
+                let fut = self.handle_rpc_message(from, to, packet);
                 ActorResponse::r#async(fut.into_actor(self))
             }
-            ProtocolCmd::RoamingPacket(_, _) => {
+            ProtocolCmd::RoamingPacket {
+                address: _,
+                packet: _,
+            } => {
                 let err = SessionError::Disconnected;
                 ActorResponse::reply(Err(err.into()))
             }
@@ -229,31 +217,36 @@ where
     }
 }
 
-impl<Key> Handler<Unicast<Key>> for ServiceBusProtocol<Key>
+impl<Key> Handler<internal::Call> for ServiceBusProtocol<Key>
 where
     Key: Hash + Eq + Clone + Debug + Unpin + Send + TryFrom<Vec<u8>> + 'static,
 {
     type Result = ActorResponse<Self, Vec<u8>, Error>;
 
-    fn handle(&mut self, mut msg: Unicast<Key>, _ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, mut msg: internal::Call, _ctx: &mut Self::Context) -> Self::Result {
         let request_id = CALL_SEQUENCE.fetch_add(1, SeqCst);
-        let cmd = match Self::build_request(request_id, msg) {
-            Ok(cmd) => cmd,
-            Err(err) => return ActorResponse::reply(Err(err.into())),
-        };
+        let callee = msg.callee.clone();
 
-        let net = self.net.clone();
-        let trigger = self
-            .requests
-            .entry(request_id)
-            .or_insert_with(TriggerFut::default)
-            .clone();
+        let trigger = self.requests.new_entry(request_id, callee);
         let mut trigger_err = trigger.clone();
 
+        let net = self.net.clone();
         let fut = async move {
-            net.send(cmd).await??;
-            let raw = trigger.await?;
-            match deser::<_, Result<Vec<u8>, String>>(raw.as_slice())? {
+            let request = internal::Message::Request {
+                request_id,
+                addr: msg.addr,
+                body: msg.body,
+            };
+            let packet = Packet::try_unordered::<Self, _>(&request)?;
+            net.send(SendCmd::Session {
+                from: msg.caller,
+                to: msg.callee,
+                packet,
+            })
+            .await??;
+
+            let response = trigger.await?;
+            match deser::<_, Result<Vec<u8>, String>>(response.as_slice())? {
                 Ok(vec) => Ok(vec),
                 Err(err) => Err(ProtocolError::Call(err).into()),
             }
@@ -273,7 +266,6 @@ where
 {
     proto: Addr<ServiceBusProtocol<Key>>,
     net: Recipient<SendCmd<Key>>,
-    dht: Recipient<DhtCmd<Key>>,
 }
 
 impl<Key> RawHandler for ServiceBusHandler<Key>
@@ -283,77 +275,45 @@ where
     type Result = LocalBoxFuture<'static, std::result::Result<Vec<u8>, ya_service_bus::Error>>;
 
     fn handle(&mut self, caller: &str, addr: &str, msg: &[u8]) -> Self::Result {
-        let parsed = match parse_addr(addr) {
+        let parsed = match ServiceBusAddr::try_from(addr) {
             Ok(res) => res,
-            Err(err) => return async move { Err(gsb_error(err)) }.boxed_local(),
+            Err(err) => return async move { Err::<Vec<u8>, _>(gsb_error(err)) }.boxed_local(),
         };
 
-        let caller = caller.to_string();
-        let body = msg.to_vec();
-        let net = self.net.clone();
+        let caller = caller.to_owned();
+        let body = msg.to_owned();
 
         match parsed {
-            ParsedAddr::Broadcast => {
-                let cmd = SendCmd::Broadcast {
-                    from: None,
-                    packet: Packet {
-                        guarantees: Guarantees::unordered(),
-                        payload: Payload::new(ServiceBusProtocol::<Key>::PROTOCOL_ID)
-                            .with_payload(msg.to_vec())
-                            .with_signature(),
-                    },
-                };
-
+            ServiceBusAddr::Unicast { callee, addr } => {
+                let proto = self.proto.clone();
                 async move {
-                    net.send(cmd).await??;
-                    Ok(Vec::new())
+                    proto
+                        .send(internal::Call {
+                            caller: caller.parse()?,
+                            callee: callee.parse()?,
+                            addr,
+                            body,
+                        })
+                        .await?
                 }
                 .map_err(|e: Error| gsb_error(e))
                 .boxed_local()
             }
-            ParsedAddr::Unicast(callee, addr) => {
-                let proto = self.proto.clone();
-                let dht = self.dht.clone();
-
-                async move {
-                    let dht_key = hex::decode(&callee[2..]).map_err(|e| {
-                        Error::from(ProtocolError::Call(format!("Invalid address: {}", callee)))
-                    })?;
-                    let dht_value = match dht.send(DhtCmd::ResolveValue(dht_key)).await?? {
-                        DhtResponse::Value(vec) => {
-                            Key::try_from(vec).map_err(|_| CryptoError::InvalidKey)?
-                        }
-                        _ => return Err(Error::from(DiscoveryError::NotFound)),
-                    };
-
-                    let msg = Unicast {
-                        caller,
-                        callee,
-                        addr,
-                        body,
-                        node_key: dht_value,
-                    };
-                    proto.send(msg).await?
-                }
-                .map_err(gsb_error)
-                .boxed_local()
+            ServiceBusAddr::Broadcast { ttl: _, addr: _ } => {
+                let send = self.net.send(SendCmd::Broadcast {
+                    packet: Packet::unordered::<ServiceBusProtocol<Key>>(body),
+                });
+                async move { send.await?.map(|_| Vec::new()) }
+                    .map_err(|e: Error| gsb_error(e))
+                    .boxed_local()
             }
         }
     }
 }
 
-fn parse_addr(src: &str) -> Result<ParsedAddr, Error> {
-    let split: Vec<_> = src.splitn(4, '/').collect();
-    let to = split[2];
-
-    if split.len() == 3 && to == "broadcast" {
-        Ok(ParsedAddr::Broadcast)
-    } else if split.len() < 4 {
-        Err(Error::Service(format!("Invalid address: {}", src)))
-    } else {
-        let endpoint = format!("/public/{}", split[3]);
-        Ok(ParsedAddr::Unicast(to.to_string(), endpoint))
-    }
+#[inline]
+fn rpc_error(err: impl ToString) -> Error {
+    ProtocolError::Call(err.to_string()).into()
 }
 
 #[inline]
@@ -361,32 +321,110 @@ fn gsb_error(err: impl ToString) -> ya_service_bus::Error {
     ya_service_bus::Error::GsbBadRequest(err.to_string())
 }
 
-enum ParsedAddr {
-    Unicast(String, String),
-    Broadcast,
+#[inline(always)]
+fn router_send<'s, S: AsRef<str>, D: AsRef<[u8]>>(
+    addr: S,
+    from: S,
+    bytes: D,
+) -> impl Future<Output = Result<Vec<u8>, ya_service_bus::Error>> + Unpin + 's {
+    ya_service_bus::untyped::send(addr.as_ref(), from.as_ref(), bytes.as_ref())
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-enum NetRpcMessage {
-    Request {
-        request_id: usize,
-        caller: String,
-        callee: String,
-        addr: String,
-        body: Vec<u8>,
-    },
-    Response {
-        request_id: usize,
-        body: Vec<u8>,
-    },
+struct RequestMap {
+    inner: HashMap<usize, (Identity, RequestFut)>,
 }
 
-#[derive(Clone, Debug, Message)]
-#[rtype(result = "Result<Vec<u8>, Error>")]
-struct Unicast<Key> {
-    caller: String,
-    callee: String,
-    addr: String,
-    body: Vec<u8>,
-    node_key: Key,
+impl RequestMap {
+    fn new_entry(&mut self, request_id: usize, callee: Identity) -> RequestFut {
+        self.inner
+            .entry(request_id)
+            .or_insert_with(|| (callee, RequestFut::default()))
+            .1
+            .clone()
+    }
+
+    #[inline]
+    fn get_mut(&mut self, request_id: &usize) -> Option<&mut (Identity, RequestFut)> {
+        self.inner.get_mut(&request_id)
+    }
+
+    #[inline]
+    fn remove(&mut self, request_id: &usize) -> Option<(Identity, RequestFut)> {
+        self.inner.remove(&request_id)
+    }
+
+    #[inline]
+    fn remove_finished(&mut self) {
+        self.inner.retain(|_, (_, t)| t.is_pending());
+    }
+}
+
+impl Default for RequestMap {
+    fn default() -> Self {
+        RequestMap {
+            inner: HashMap::new(),
+        }
+    }
+}
+
+enum ServiceBusAddr {
+    Unicast { callee: String, addr: String },
+    Broadcast { ttl: u8, addr: String },
+}
+
+impl TryFrom<&str> for ServiceBusAddr {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let split: Vec<_> = value.splitn(4, '/').collect();
+        if split.len() < 4 {
+            return Err(Error::Service(format!("Invalid address: {}", value)));
+        }
+
+        let addr = format!("/public/{}", split[3]);
+        let callee = split[2];
+
+        if callee.starts_with("broadcast") {
+            let broadcast: Vec<_> = callee.splitn(2, ':').collect();
+            let ttl: u8 = match broadcast.get(1) {
+                Some(s) => s
+                    .parse()
+                    .map_err(|_| Error::Service(format!("Invalid address: {}", value)))?,
+                _ => 1,
+            };
+            Ok(ServiceBusAddr::Broadcast { ttl, addr })
+        } else {
+            let callee = callee.to_string();
+            Ok(ServiceBusAddr::Unicast { callee, addr })
+        }
+    }
+}
+
+mod internal {
+    use crate::identity::Identity;
+    use crate::Result;
+    use serde::{Deserialize, Serialize};
+    use std::fmt::Debug;
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub(super) enum Message {
+        Request {
+            request_id: usize,
+            addr: String,
+            body: Vec<u8>,
+        },
+        Response {
+            request_id: usize,
+            body: Vec<u8>,
+        },
+    }
+
+    #[derive(Clone, Debug, actix::Message, Serialize, Deserialize)]
+    #[rtype(result = "Result<Vec<u8>>")]
+    pub(super) struct Call {
+        pub caller: Identity,
+        pub callee: Identity,
+        pub addr: String,
+        pub body: Vec<u8>,
+    }
 }

@@ -1,10 +1,12 @@
 use crate::error::DiscoveryError;
 use crate::packet::{AddressedPacket, Packet, WirePacket};
-use crate::transport::Address;
-use crate::{ProtocolId, Result, TransportId};
+use crate::protocol::ProtocolId;
+use crate::transport::{Address, TransportId};
+use crate::{Identity, Result};
 use actix::prelude::*;
 use futures::channel::mpsc::Sender;
 use serde::{Deserialize, Serialize};
+use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::net::SocketAddr;
 
@@ -12,13 +14,13 @@ use std::net::SocketAddr;
 #[rtype(result = "Result<()>")]
 pub enum ServiceCmd<Key>
 where
-    Key: Send + Debug + Clone,
+    Key: Send + Debug + Clone + 'static,
 {
     SetSessionProtocol(Recipient<SessionCmd<Key>>),
     SetDhtProtocol(Recipient<DhtCmd<Key>>),
     AddTransport(TransportId, Recipient<TransportCmd>),
     RemoveTransport(TransportId),
-    AddProtocol(ProtocolId, Recipient<ProtocolCmd<Key>>),
+    AddProtocol(ProtocolId, Recipient<ProtocolCmd>),
     RemoveProtocol(ProtocolId),
     AddProcessor(Recipient<ProcessCmd<Key>>),
     RemoveProcessor(Recipient<ProcessCmd<Key>>),
@@ -27,30 +29,23 @@ where
 
 unsafe impl<Key> Send for ServiceCmd<Key> where Key: Send + Debug + Clone {}
 
-#[derive(Clone, Debug, Message)]
+#[derive(Message)]
 #[rtype(result = "Result<()>")]
-pub enum SendCmd<Key>
-where
-    Key: Send + Debug + Clone,
-{
+pub enum SendCmd<Key: Send + 'static> {
     Roaming {
         from: Option<Key>,
         to: Address,
         packet: Packet,
     },
     Session {
-        from: Option<Key>,
-        to: Key,
+        from: Identity,
+        to: Identity,
         packet: Packet,
     },
     Broadcast {
-        from: Option<Key>,
         packet: Packet,
     },
-    Disconnect(Key, DisconnectReason),
 }
-
-unsafe impl<Key> Send for SendCmd<Key> where Key: Send + Debug + Clone {}
 
 #[derive(Clone, Debug, Message)]
 #[rtype(result = "Result<()>")]
@@ -66,53 +61,69 @@ unsafe impl Send for TransportCmd {}
 
 #[derive(Clone, Debug, Message)]
 #[rtype(result = "Result<()>")]
-pub enum ProtocolCmd<Key>
-where
-    Key: Send + Debug + Clone,
-{
-    RoamingPacket(Address, Packet),
-    SessionPacket(Address, Packet, Key),
+pub enum ProtocolCmd {
+    RoamingPacket {
+        address: Address,
+        packet: Packet,
+    },
+    SessionPacket {
+        from: Identity,
+        to: Identity,
+        address: Address,
+        packet: Packet,
+    },
     Shutdown,
 }
 
-unsafe impl<Key> Send for ProtocolCmd<Key> where Key: Send + Debug + Clone {}
+unsafe impl Send for ProtocolCmd {}
 
-#[derive(Clone, Debug, Message)]
+#[derive(Clone, Message)]
 #[rtype(result = "Result<()>")]
 pub enum SessionCmd<Key>
 where
-    Key: Send + Debug + Clone,
+    Key: Send + Clone + 'static,
 {
-    Initiate(Address),
-    Disconnect(Key, DisconnectReason),
+    Initiate {
+        from: Key,
+        from_identity: Identity,
+        to: Key,
+        to_identity: Identity,
+        address: Address,
+    },
 }
 
-unsafe impl<Key> Send for SessionCmd<Key> where Key: Send + Debug + Clone {}
+unsafe impl<Key> Send for SessionCmd<Key> where Key: Send + Clone {}
 
-#[derive(Clone, Debug, Message)]
-#[rtype(result = "Result<DhtResponse>")]
+#[derive(Clone, Message)]
+#[rtype(result = "Result<DhtResponse<Key>>")]
 pub enum DhtCmd<Key>
 where
-    Key: Send + Debug + Clone,
+    Key: Send + Clone + 'static,
 {
     ResolveNode(Key),
     ResolveValue(Vec<u8>),
-    PublishValue(Vec<u8>, Vec<u8>),
+    PublishValue(Vec<u8>, DhtValue<Key>),
     Bootstrap(Vec<(Vec<u8>, Address)>),
     // TODO: + node address change update
 }
 
-unsafe impl<Key> Send for DhtCmd<Key> where Key: Send + Debug + Clone {}
+unsafe impl<Key> Send for DhtCmd<Key> where Key: Send + Clone {}
 
-#[derive(Clone, Debug, MessageResponse, Serialize)]
+#[derive(Clone, MessageResponse, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub enum DhtResponse {
+pub enum DhtResponse<Key>
+where
+    Key: Clone + 'static,
+{
     Addresses(Vec<Address>),
-    Value(Vec<u8>),
+    Value(DhtValue<Key>),
     Empty,
 }
 
-impl DhtResponse {
+impl<Key> DhtResponse<Key>
+where
+    Key: Debug + Clone + 'static,
+{
     pub fn into_addresses(self) -> Result<Vec<Address>> {
         match self {
             DhtResponse::Addresses(addrs) => match addrs.len() {
@@ -123,19 +134,25 @@ impl DhtResponse {
         }
     }
 
-    pub fn into_value(self) -> Result<Vec<u8>> {
+    pub fn into_value(self) -> Result<DhtValue<Key>> {
         match self {
-            DhtResponse::Value(vec) => Ok(vec),
+            DhtResponse::Value(val) => Ok(val),
             _ => Err(DiscoveryError::NotFound.into()),
         }
     }
 }
 
-#[derive(Clone, Debug, Message)]
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DhtValue<Key: Clone> {
+    pub identity_key: Key,
+    pub node_key: Key,
+}
+
+#[derive(Clone, Message)]
 #[rtype(result = "Result<Packet>")]
 pub enum ProcessCmd<Key>
 where
-    Key: Send + Debug + Clone,
+    Key: Send + Clone,
 {
     Outbound {
         from: Option<Key>,
@@ -149,7 +166,7 @@ where
     },
 }
 
-unsafe impl<Key> Send for ProcessCmd<Key> where Key: Send + Debug + Clone {}
+unsafe impl<Key> Send for ProcessCmd<Key> where Key: Send + Clone {}
 
 #[derive(Clone, Debug, Message)]
 #[rtype(result = "()")]
@@ -161,17 +178,22 @@ pub enum TransportEvt {
 
 unsafe impl Send for TransportEvt {}
 
-#[derive(Clone, Debug, Message)]
+#[derive(Clone, Message)]
 #[rtype(result = "()")]
 pub enum SessionEvt<Key>
 where
-    Key: Send + Debug + Clone,
+    Key: Clone + 'static,
 {
-    Established(Address, Key),
-    Disconnected(Key),
+    Established {
+        from: Key,
+        from_identity: Identity,
+        to: Key,
+        to_identity: Identity,
+        address: Address,
+    },
 }
 
-unsafe impl<Key> Send for SessionEvt<Key> where Key: Send + Debug + Clone {}
+unsafe impl<Key> Send for SessionEvt<Key> where Key: Send + Clone {}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DisconnectReason {
@@ -181,3 +203,4 @@ pub enum DisconnectReason {
     Shutdown,
     Other(String),
 }
+

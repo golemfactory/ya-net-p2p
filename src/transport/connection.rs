@@ -1,11 +1,12 @@
 use crate::common::TriggerFut;
 use crate::error::{ChannelError, Error, NetworkError};
+use crate::identity::{to_slot, Slot};
 use crate::packet::{AddressedPacket, WirePacket};
 use crate::transport::Address;
 use crate::{ConnectionInfo, Result};
 use futures::channel::mpsc::Sender;
 use futures::{Future, SinkExt, TryFutureExt};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::AtomicUsize;
@@ -14,27 +15,27 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub type ConnectionId = usize;
-pub type ConnectionFut<Ctx> = TriggerFut<Result<Connection<Ctx>>>;
+pub type ConnectionFut = TriggerFut<Result<Connection>>;
 
 static CONNECTION_ID_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
-pub struct Connection<Ctx> {
+pub struct Connection {
     pub id: ConnectionId,
     pub address: Address,
     pub created: Instant,
     channel: Sender<AddressedPacket>,
-    ctx: Arc<Mutex<Option<Ctx>>>,
+    slots: Arc<Mutex<HashSet<(Slot, Slot)>>>,
 }
 
-impl<Ctx: Clone> Connection<Ctx> {
+impl Connection {
     pub fn new(address: Address, channel: Sender<AddressedPacket>) -> Self {
         Connection {
             id: CONNECTION_ID_SEQ.fetch_add(1, SeqCst),
             address,
             created: Instant::now(),
             channel,
-            ctx: Arc::new(Mutex::new(None)),
+            slots: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -55,53 +56,52 @@ impl<Ctx: Clone> Connection<Ctx> {
     }
 
     #[inline]
-    pub fn ctx(&self) -> Option<Ctx> {
-        let ctx = self.ctx.lock().unwrap();
-        (*ctx).clone()
+    pub fn slot<S: AsRef<[u8]>>(&mut self, local: S, remote: S) {
+        let tuple = (to_slot(local), to_slot(remote));
+        self.slots.lock().unwrap().insert(tuple);
     }
 
     #[inline]
-    pub fn set_ctx(&mut self, new_ctx: Ctx) {
-        let mut ctx = self.ctx.lock().unwrap();
-        (*ctx).replace(new_ctx);
+    pub fn take_slots(&mut self) -> HashSet<(Slot, Slot)> {
+        std::mem::replace(&mut (*self.slots.lock().unwrap()), HashSet::new())
     }
 }
 
-impl<Ctx> Hash for Connection<Ctx> {
+impl Hash for Connection {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.address.hash(state)
     }
 }
 
-impl<Ctx> PartialEq for Connection<Ctx> {
+impl PartialEq for Connection {
     fn eq(&self, other: &Self) -> bool {
         self.address == other.address
     }
 }
 
-impl<Ctx: Clone + Debug> Debug for Connection<Ctx> {
+impl Debug for Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         <Self as std::fmt::Display>::fmt(self, f)
     }
 }
 
-impl<Ctx: Clone + Debug> std::fmt::Display for Connection<Ctx> {
+impl std::fmt::Display for Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!(
-            "Connection {{ address: {:?}, since: {:?}, id: {:?}, ctx: {:?} }}",
-            self.address, self.created, self.id, self.ctx
+            "Connection {{ address: {:?}, since: {:?}, id: {:?} }}",
+            self.address, self.created, self.id
         ))
     }
 }
 
-pub enum PendingConnection<Ctx: Clone + Debug> {
-    New(ConnectionFut<Ctx>),
-    Pending(ConnectionFut<Ctx>),
-    Established(ConnectionFut<Ctx>),
+pub enum PendingConnection {
+    New(ConnectionFut),
+    Pending(ConnectionFut),
+    Established(ConnectionFut),
 }
 
-impl<Ctx: Clone + Debug> From<PendingConnection<Ctx>> for ConnectionFut<Ctx> {
-    fn from(pending: PendingConnection<Ctx>) -> Self {
+impl From<PendingConnection> for ConnectionFut {
+    fn from(pending: PendingConnection) -> Self {
         match pending {
             PendingConnection::New(f)
             | PendingConnection::Pending(f)
@@ -110,13 +110,12 @@ impl<Ctx: Clone + Debug> From<PendingConnection<Ctx>> for ConnectionFut<Ctx> {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct ConnectionManager<Ctx: Clone + Debug> {
-    pending: HashMap<Address, ConnectionFut<Ctx>>,
-    established: HashMap<Address, Connection<Ctx>>,
+pub struct ConnectionManager {
+    pending: HashMap<Address, ConnectionFut>,
+    established: HashMap<Address, Connection>,
 }
 
-impl<Ctx: Clone + Debug> Default for ConnectionManager<Ctx> {
+impl Default for ConnectionManager {
     fn default() -> Self {
         ConnectionManager {
             pending: HashMap::new(),
@@ -125,9 +124,9 @@ impl<Ctx: Clone + Debug> Default for ConnectionManager<Ctx> {
     }
 }
 
-impl<Ctx: Clone + Debug> ConnectionManager<Ctx> {
+impl ConnectionManager {
     #[inline]
-    pub fn get(&self, address: &Address) -> Option<&Connection<Ctx>> {
+    pub fn get(&self, address: &Address) -> Option<&Connection> {
         self.established.get(address)
     }
 
@@ -145,7 +144,7 @@ impl<Ctx: Clone + Debug> ConnectionManager<Ctx> {
         }
     }
 
-    pub fn disconnected(&mut self, address: &Address) -> Option<Connection<Ctx>> {
+    pub fn disconnected(&mut self, address: &Address) -> Option<Connection> {
         if let Some(mut trigger) = self.pending.remove(&address) {
             let error = Error::from(NetworkError::NoConnection);
             trigger.ready(Err(error));
@@ -154,7 +153,7 @@ impl<Ctx: Clone + Debug> ConnectionManager<Ctx> {
         self.established.remove(&address)
     }
 
-    pub fn pending(&mut self, address: Address) -> PendingConnection<Ctx> {
+    pub fn pending(&mut self, address: Address) -> PendingConnection {
         let is_pending = self.pending.contains_key(&address);
         let mut trigger = self
             .pending

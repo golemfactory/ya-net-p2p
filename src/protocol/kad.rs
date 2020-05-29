@@ -1,8 +1,8 @@
 use crate::common::FlattenResult;
 use crate::error::{DiscoveryError, Error, MessageError, NetworkError, ProtocolError};
-use crate::event::{DhtCmd, DhtResponse, ProtocolCmd, SendCmd};
+use crate::event::{DhtCmd, DhtResponse, DhtValue, ProtocolCmd, SendCmd};
 use crate::packet::{Guarantees, Packet, Payload};
-use crate::protocol::{Protocol, ProtocolId};
+use crate::protocol::{Protocol, ProtocolId, ProtocolVersion};
 use crate::transport::Address;
 use crate::Result;
 use actix::prelude::*;
@@ -32,13 +32,14 @@ where
     kad: KadState<N, D>,
 }
 
-impl<N, D> Protocol<Key<N>> for KadProtocol<N, D>
+impl<N, D> Protocol for KadProtocol<N, D>
 where
     N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
     D: NodeDataExt + 'static,
 {
-    const PROTOCOL_ID: ProtocolId = 1000;
+    const ID: ProtocolId = 100;
+    const VERSION: ProtocolVersion = 0;
 }
 
 impl<N, D> KadProtocol<N, D>
@@ -67,7 +68,7 @@ where
 
 impl<N, D> Actor for KadProtocol<N, D>
 where
-    N: KeyLen + Unpin + 'static,
+    N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
     D: NodeDataExt + 'static,
 {
@@ -92,11 +93,11 @@ where
 
 impl<N, D> Handler<DhtCmd<Key<N>>> for KadProtocol<N, D>
 where
-    N: KeyLen + Unpin + 'static,
+    N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
     D: NodeDataExt + 'static,
 {
-    type Result = ActorResponse<Self, DhtResponse, Error>;
+    type Result = ActorResponse<Self, DhtResponse<Key<N>>, Error>;
 
     fn handle(&mut self, msg: DhtCmd<Key<N>>, _: &mut Context<Self>) -> Self::Result {
         let kad = match self.kad.addr() {
@@ -136,7 +137,8 @@ where
                         .await??
                         .ok_or(Error::from(DiscoveryError::NotFound))?;
 
-                    log::debug!("Resolved value {}: {:?}", hex_key, value);
+                    let value = DhtValue::<Key<N>>::try_from(value)?;
+                    log::debug!("Resolved value for {}", hex_key);
                     Ok(DhtResponse::Value(value))
                 };
 
@@ -149,7 +151,7 @@ where
                 let fut = async move {
                     kad.send(KadStore {
                         key,
-                        value,
+                        value: value.into(),
                         persistent: true,
                     })
                     .await??;
@@ -216,18 +218,25 @@ where
     }
 }
 
-impl<N, D> Handler<ProtocolCmd<Key<N>>> for KadProtocol<N, D>
+impl<N, D> Handler<ProtocolCmd> for KadProtocol<N, D>
 where
-    N: KeyLen + Unpin + 'static,
+    N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
     D: NodeDataExt + 'static,
 {
     type Result = ActorResponse<Self, (), Error>;
 
-    fn handle(&mut self, msg: ProtocolCmd<Key<N>>, ctx: &mut Context<Self>) -> Self::Result {
+    fn handle(&mut self, msg: ProtocolCmd, ctx: &mut Context<Self>) -> Self::Result {
         match msg {
-            ProtocolCmd::SessionPacket(address, mut packet, _)
-            | ProtocolCmd::RoamingPacket(address, mut packet) => {
+            ProtocolCmd::SessionPacket {
+                address,
+                mut packet,
+                ..
+            }
+            | ProtocolCmd::RoamingPacket {
+                address,
+                mut packet,
+            } => {
                 let kad = match self.kad.addr() {
                     Ok(kad) => kad,
                     Err(err) => return actor_reply(err),
@@ -236,7 +245,8 @@ where
                 let fut = async move {
                     let key_vec = packet
                         .payload
-                        .signature()
+                        .signature
+                        .as_ref()
                         .map(|sig| sig.key())
                         .flatten()
                         .ok_or(MessageError::MissingSignature)?;
@@ -246,7 +256,7 @@ where
                             key: Key::<N>::try_from(key_vec)?,
                             data: D::from_address(address),
                         },
-                        message: KadMessage::from_bytes(packet.payload.payload().vec())?,
+                        message: KadMessage::from_bytes(packet.payload.body.as_ref())?,
                     })
                     .await??;
 
@@ -255,17 +265,14 @@ where
 
                 ActorResponse::r#async(fut.into_actor(self))
             }
-            ProtocolCmd::Shutdown => {
-                ctx.stop();
-                ActorResponse::reply(Ok(()))
-            }
+            ProtocolCmd::Shutdown => ActorResponse::reply(Ok(())),
         }
     }
 }
 
 impl<N, D> StreamHandler<KadEvtSend<N, D>> for KadProtocol<N, D>
 where
-    N: KeyLen + Unpin + 'static,
+    N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
     D: NodeDataExt + 'static,
 {
@@ -278,7 +285,6 @@ where
                 return;
             }
         };
-
         let packet = match Packet::try_from(evt) {
             Ok(packet) => packet,
             Err(err) => {
@@ -286,7 +292,6 @@ where
                 return;
             }
         };
-
         let send_fut = self.net.send(SendCmd::Roaming { from, to, packet });
         let fut = async move {
             if let Err(e) = send_fut.await.flatten_result() {
@@ -294,6 +299,26 @@ where
             }
         };
         ctx.spawn(fut.into_actor(self));
+    }
+}
+
+impl<N: KeyLen> From<DhtValue<Key<N>>> for Vec<u8> {
+    fn from(val: DhtValue<Key<N>>) -> Self {
+        let mut vec = val.identity_key.to_vec();
+        vec.extend(val.node_key.to_vec());
+        vec
+    }
+}
+
+impl<N: KeyLen> TryFrom<Vec<u8>> for DhtValue<Key<N>> {
+    type Error = Error;
+
+    fn try_from(mut value: Vec<u8>) -> Result<Self> {
+        let remaining = value.split_off(value.len() / 2);
+        Ok(Self {
+            identity_key: Key::try_from(value)?,
+            node_key: Key::try_from(remaining)?,
+        })
     }
 }
 
@@ -308,7 +333,7 @@ where
 
 enum KadState<N, D>
 where
-    N: KeyLen + Unpin + 'static,
+    N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
     D: NodeDataExt + 'static,
 {
@@ -324,7 +349,7 @@ where
 
 impl<N, D> KadState<N, D>
 where
-    N: KeyLen + Unpin + 'static,
+    N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
     D: NodeDataExt,
 {
@@ -339,7 +364,7 @@ where
 
 impl<N, D> KadState<N, D>
 where
-    N: KeyLen + Unpin + 'static,
+    N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
     D: NodeDataExt + 'static,
 {
@@ -370,7 +395,7 @@ where
 
 impl<N, D> std::fmt::Display for KadState<N, D>
 where
-    N: KeyLen + Unpin + 'static,
+    N: KeyLen + 'static,
     <N as ArrayLength<u8>>::ArrayType: Unpin,
     D: NodeDataExt,
 {
@@ -398,12 +423,10 @@ where
 {
     type Error = Error;
 
+    #[inline]
     fn try_from(evt: KadEvtSend<N, D>) -> std::result::Result<Self, Self::Error> {
-        Ok(Packet {
-            payload: Payload::new(KadProtocol::<N, D>::PROTOCOL_ID)
-                .with_payload(evt.message.to_bytes()?)
-                .with_signature(),
-            guarantees: Guarantees::unordered(),
-        })
+        Ok(Packet::unordered::<KadProtocol<N, D>>(
+            evt.message.to_bytes()?,
+        ))
     }
 }
