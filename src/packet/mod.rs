@@ -1,13 +1,15 @@
+use crate::error::{Error, MessageError};
+use crate::identity::{Identity, Slot};
 use crate::packet::codec::Codec;
-use crate::transport::StreamId;
-use crate::{Address, Result, TransportId};
-use std::net::SocketAddr;
-
 pub use crate::packet::payload::Payload;
 pub use crate::packet::processor::crypto::CryptoProcessor;
+use crate::protocol::Protocol;
+use crate::transport::{Address, StreamId, TransportId};
+use crate::Result;
+use serde::Serialize;
+use std::net::SocketAddr;
 
 pub(crate) mod codec;
-pub(crate) mod header;
 pub(crate) mod payload;
 pub mod processor;
 
@@ -15,6 +17,75 @@ pub mod processor;
 pub struct Packet {
     pub guarantees: Guarantees,
     pub payload: Payload,
+}
+
+impl Packet {
+    #[inline]
+    pub fn signer(&self) -> Option<Vec<u8>> {
+        self.payload.signature.as_ref().map(|s| s.key()).flatten()
+    }
+
+    #[inline]
+    pub fn slots(&self) -> Option<(Slot, Slot)> {
+        if let Some(sender) = &self.payload.sender {
+            if let Some(recipient) = &self.payload.recipient {
+                return Some((*sender, *recipient));
+            }
+        }
+        None
+    }
+
+    #[inline]
+    pub fn ordered<P: Protocol>(body: Vec<u8>) -> Self {
+        let guarantees = Guarantees::ordered_default();
+        Self::with::<P>(body, guarantees)
+    }
+
+    #[inline]
+    pub fn unordered<P: Protocol>(body: Vec<u8>) -> Self {
+        let guarantees = Guarantees::unordered();
+        Self::with::<P>(body, guarantees)
+    }
+
+    #[inline]
+    pub fn with<P: Protocol>(body: Vec<u8>, guarantees: Guarantees) -> Self {
+        Packet {
+            guarantees,
+            payload: Payload::new(P::ID, P::VERSION, body),
+        }
+    }
+
+    #[inline]
+    pub fn try_ordered<P: Protocol, B: Serialize>(body: B) -> Result<Self> {
+        let guarantees = Guarantees::ordered_default();
+        Self::try_with::<P, _>(body, guarantees)
+    }
+
+    #[inline]
+    pub fn try_unordered<P: Protocol, B: Serialize>(body: B) -> Result<Self> {
+        let guarantees = Guarantees::unordered();
+        Self::try_with::<P, _>(body, guarantees)
+    }
+
+    #[inline]
+    pub fn try_with<P: Protocol, B: Serialize>(body: B, guarantees: Guarantees) -> Result<Self> {
+        Ok(Packet {
+            guarantees,
+            payload: Payload::try_with(P::ID, P::VERSION, &body)?,
+        })
+    }
+
+    #[inline(always)]
+    pub fn sign(mut self) -> Self {
+        self.payload = self.payload.sign();
+        self
+    }
+
+    #[inline(always)]
+    pub fn encrypt(mut self) -> Self {
+        self.payload = self.payload.encrypt();
+        self
+    }
 }
 
 #[derive(Clone, Debug)]
