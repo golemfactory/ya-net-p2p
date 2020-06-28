@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 pub use key::{lengths as key_lengths, Key, KeyLen};
 pub use node::{Node, NodeData};
 pub use service::{Kad, KadConfig};

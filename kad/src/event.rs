@@ -172,7 +172,7 @@ impl KadMessage {
         }
     }
 
-    pub fn from_bytes(bytes : &[u8]) -> Result<KadMessage> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<KadMessage> {
         let packet = crate::message::KadMessage::decode(bytes)?;
         Ok(match packet.payload {
             Some(Payload::Ping(p)) => KadMessage::Ping(p),
@@ -182,16 +182,15 @@ impl KadMessage {
             Some(Payload::FindNodeResult(p)) => KadMessage::FindNodeResult(p),
             Some(Payload::FindValue(p)) => KadMessage::FindValue(p),
             Some(Payload::FindValueResult(p)) => KadMessage::FindValueResult(p),
-            None => return Err(crate::Error::UnknownPacket)
+            None => return Err(crate::Error::UnknownPacket),
         })
     }
 
     pub fn to_bytes(self) -> Result<Vec<u8>> {
-        let msg : crate::message::KadMessage = self.into();
+        let msg: crate::message::KadMessage = self.into();
         let len = msg.encoded_len();
         let mut buf = Vec::with_capacity(len);
         msg.encode(&mut buf)?;
         Ok(buf)
     }
 }
-

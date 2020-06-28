@@ -9,12 +9,12 @@ pub mod protocol;
 mod serialize;
 mod service;
 mod session;
-pub mod transport;
 mod status;
+pub mod transport;
 
-pub use status::{ConnectionInfo, GetStatus, StatusInfo};
 pub use error::Error;
 pub use identity::Identity;
 pub use service::*;
+pub use status::{ConnectionInfo, GetStatus, StatusInfo};
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -890,7 +890,7 @@ where
 {
     type Result = Result<KadStatus>;
 
-    fn handle(&mut self, msg: QueryKadStatus, ctx: &mut Context<Self>) -> Self::Result {
+    fn handle(&mut self, _msg: QueryKadStatus, _ctx: &mut Context<Self>) -> Self::Result {
         Ok(KadStatus {
             host_node: KadStatusNodeInfo::from_node(&self.node),
             nodes: self.table.status(),

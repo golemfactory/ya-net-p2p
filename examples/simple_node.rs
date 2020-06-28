@@ -4,21 +4,21 @@ use actix_web::error::{ErrorBadRequest, ErrorInternalServerError};
 use actix_web::{get, web, App, HttpRequest, HttpServer, Responder};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::convert::{TryFrom, TryInto};
+use std::convert::TryInto;
 use std::env;
 use std::net::SocketAddr;
 use std::time::Duration;
 use structopt::StructOpt;
 use ya_net_kad::key_lengths::U20;
-use ya_net_kad::{KadStatus, Node, QueryKadStatus};
+use ya_net_kad::{Node, QueryKadStatus};
 use ya_net_p2p::crypto::no_crypto;
 use ya_net_p2p::event::{DhtCmd, ServiceCmd};
+use ya_net_p2p::identity::IdentityManager;
 use ya_net_p2p::packet::CryptoProcessor;
 use ya_net_p2p::protocol::kad::{KadProtocol, NodeDataExt};
 use ya_net_p2p::protocol::session::SessionProtocol;
 use ya_net_p2p::transport::laminar::LaminarTransport;
-use ya_net_p2p::{transport::Address, GetStatus, Net, NetAddrExt, Identity};
-use ya_net_p2p::identity::IdentityManager;
+use ya_net_p2p::{transport::Address, GetStatus, Identity, Net, NetAddrExt};
 
 type KeySize = U20;
 type Key = ya_net_kad::Key<KeySize>;
@@ -104,7 +104,7 @@ async fn dht_status(dht: web::Data<DhtStatus>) -> impl Responder {
 }
 
 #[get("/")]
-async fn index(req: HttpRequest) -> std::io::Result<NamedFile> {
+async fn index(_req: HttpRequest) -> std::io::Result<NamedFile> {
     actix_files::NamedFile::open("examples/simple_node.html")
 }
 
@@ -141,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
     let dht: Addr<KadProtocol<KeySize, NodeDataExample>> =
         net.set_dht(KadProtocol::new(node.clone(), &net));
     let _ = dht.send(QueryKadStatus::default());
-    net.set_session(SessionProtocol::new(&identity_manager,&net, &net));
+    net.set_session(SessionProtocol::new(&identity_manager, &net, &net));
     net.add_processor(CryptoProcessor::new(&identity_manager, no_crypto()));
     net.add_transport(LaminarTransport::<Key>::new(&net));
     log::info!("Node key: {}", hex::encode(&node.key));

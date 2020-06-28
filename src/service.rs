@@ -7,7 +7,7 @@ use crate::protocol::{Protocol, ProtocolId};
 use crate::session::Session;
 use crate::transport::connection::{ConnectionManager, PendingConnection};
 use crate::transport::{Address, Transport, TransportId};
-use crate::{Identity, GetStatus, Result, StatusInfo};
+use crate::{GetStatus, Identity, Result, StatusInfo};
 use actix::prelude::*;
 use futures::{Future, FutureExt, StreamExt, TryFutureExt};
 use hashbrown::{HashMap, HashSet};
@@ -700,10 +700,7 @@ where
             let addr = actor.start();
             self.do_send(ServiceCmd::SetDhtProtocol(addr.clone().recipient()));
             self.do_send(ServiceCmd::AddProtocol(A::ID, addr.clone().recipient()));
-            self.do_send(ServiceCmd::AddProtocol(
-                A::ID,
-                addr.clone().recipient(),
-            ));
+            self.do_send(ServiceCmd::AddProtocol(A::ID, addr.clone().recipient()));
             addr
         }
     }

@@ -55,9 +55,7 @@ impl Signature {
     pub fn set_data(&mut self, vec: Vec<u8>) {
         match self {
             Signature::ECDSA(ecdsa) => ecdsa.set_data(vec),
-            Signature::Plain(data) => {
-                unimplemented!()
-            },
+            Signature::Plain(data) => unimplemented!(),
         }
     }
 
