@@ -203,4 +203,3 @@ pub enum DisconnectReason {
     Shutdown,
     Other(String),
 }
-

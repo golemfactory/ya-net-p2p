@@ -12,9 +12,7 @@ pub struct QueryKadStatus {
 
 impl Default for QueryKadStatus {
     fn default() -> Self {
-        QueryKadStatus {
-            query_dht: false,
-        }
+        QueryKadStatus { query_dht: false }
     }
 }
 
