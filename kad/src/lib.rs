@@ -1,6 +1,7 @@
 pub use key::{lengths as key_lengths, Key, KeyLen};
 pub use node::{Node, NodeData};
 pub use service::{Kad, KadConfig};
+pub use status::{KadStatus, KadStatusNodeInfo, QueryKadStatus};
 pub use table::Table;
 
 pub mod event;
@@ -9,6 +10,7 @@ mod node;
 mod query;
 mod serialize;
 mod service;
+mod status;
 mod table;
 
 pub mod message {

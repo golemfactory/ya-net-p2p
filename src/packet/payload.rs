@@ -143,6 +143,10 @@ impl Codec for Signature {
                 bytes.put_u8(0u8);
                 ecdsa.encode(bytes);
             }
+            Signature::Plain(key) => {
+                bytes.put_u8(1u8);
+                Body::encode_with_vec(&key, bytes);
+            }
         }
     }
 
@@ -150,6 +154,7 @@ impl Codec for Signature {
         let marker = bytes.get_u8();
         match marker {
             0u8 => Ok(Signature::ECDSA(SignatureECDSA::decode(bytes)?)),
+            1u8 => Ok(Signature::Plain(Body::decode_to_vec(bytes)?)),
             _ => Err(MessageError::UnsupportedSignature.into()),
         }
     }
@@ -268,6 +273,15 @@ mod test {
             key: None,
         }));
 
+        let mut decoded = Payload::decode_vec(payload.encode_vec()).unwrap();
+        assert_eq!(payload.encode_vec(), decoded.encode_vec());
+    }
+
+    #[test]
+    fn plain_sig() {
+        let protocol_id = 12345 as ProtocolId;
+        let mut payload = Payload::new(protocol_id, 0, [2u8; 29].to_vec());
+        payload.signature = Some(Signature::Plain(vec![3u8; 20]));
         let mut decoded = Payload::decode_vec(payload.encode_vec()).unwrap();
         assert_eq!(payload.encode_vec(), decoded.encode_vec());
     }

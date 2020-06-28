@@ -15,6 +15,7 @@ pub trait Transport: Actor<Context = Context<Self>> + Handler<TransportCmd> {
 
 // FIXME: placeholder
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Address {
     pub transport_id: TransportId,
     pub socket_addr: SocketAddr,

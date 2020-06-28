@@ -10,7 +10,9 @@ mod serialize;
 mod service;
 mod session;
 pub mod transport;
+mod status;
 
+pub use status::{ConnectionInfo, GetStatus, StatusInfo};
 pub use error::Error;
 pub use identity::Identity;
 pub use service::*;

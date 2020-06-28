@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>p2p node panel</title>
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.0/css/bootstrap.min.css" integrity="sha384-9aIt2nRpC12Uk9gS9baDl411NQApFmC26EwAOH8WgZl5MYYxFfc+NcPb1dKGj7Sk" crossorigin="anonymous">
+    <style>
+        .pad-top {
+            padding-top: 20px;
+        }
+    </style>
+</head>
+<body>
+
+<script type="module">
+    import {html, render} from 'https://unpkg.com/lit-html?module';
+    import {repeat} from 'https://unpkg.com/lit-html/directives/repeat.js?module';
+    import {live} from 'https://unpkg.com/lit-html/directives/live.js?module';
+
+    const protocols = {
+        '18': 'Laminar'
+    };
+
+    const formField = (formData, {name, label, comment, type}) => {
+
+        formData[name] = formData[name] || ''
+
+        const onChange = (e) => {
+            formData[name] = e.target.value;
+        }
+
+        return html`<div class="form-group">
+            <label for="key">${label}</label>
+            <input type="${type || 'text'}" class="form-control" .value=${formData[name]} @change=${onChange}>
+            ${comment ? html`<small class="form-text text-muted">${comment}</small>` : ''}
+        </div>`;
+    }
+
+    const template = (data) => {
+        const isActive = (tabName) => {
+            return (tabName === data.selected) ? "active" : ""
+        }
+
+        const navItem = (itemId, itemTitle, action) => html`<li class="nav-item ${isActive(itemId)}">
+                            <a class="nav-link" href="#" @click=${() => update({...data, selected: itemId}, action)}>${itemTitle}</a>
+                        </li>`;
+
+        const navbar = html`
+            <nav class="navbar navbar-expand-lg navbar-light bg-light">
+                <a class="navbar-brand" href="#">P2P Node</a>
+                <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarSupportedContent" aria-controls="navbarSupportedContent" aria-expanded="false" aria-label="Toggle navigation">
+                    <span class="navbar-toggler-icon"></span>
+                </button>
+                <div class="collapse navbar-collapse" id="navbarSupportedContent">
+                    <ul class="navbar-nav mr-auto">
+                        ${navItem('status', 'Status', updateStatus)}
+                        ${navItem('resolve', 'Resolve')}
+                    </ul>
+                </div>
+            </nav>`;
+
+        const resolveTab = (resolveForm) => html`
+            <div class="row">
+                <div class="col-md-6">
+                        <div class="card">
+                            <div class="card-header">Resolve</div>
+                            <div class="card-body">
+                            <h5 class="card-title">Resolve Node by Key</h5>
+                            <form>
+                              ${formField(resolveForm, {name: 'key', label: 'Node Key'})}
+                                <button type="submit" class="btn btn-primary" @click=${() => update(data, do_resolve)}>Resolve</button>
+                            </form>
+                            <div class="card-text" style="padding-top: 1em">
+                            ${resolveForm.result === 'pending' ? html`<div class="spinner-border" role="status">
+                                <span class="sr-only">Loading...</span>
+                             </div>` : html`
+                                <div class="${resolveForm.result}">
+                                ${JSON.stringify(resolveForm.resultData)}
+                            </div>`}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        const connectionTable = (connections, title, emptyMessage) => html`
+            ${connections.length > 0 ? html`
+                <h5 class="card-title">${title}</h5>
+                <table class="table table-border">
+                    <tr><th>addr</th><th>transport</th></tr>
+                    ${repeat(connections,
+                        (connection) => html`<tr><td>${connection.socketAddr}</td><td>${protocolInfo(connection)}</td></tr>`
+                    )}
+                </table>
+            ` : html`<p class="card-text">${emptyMessage}</p>
+            `}
+        `;
+
+        const protocolInfo = (addr) => html`<span class="badge badge-info">${protocols[addr.transportId.toString()]}</span>`;
+
+        const nodeData = (data) => html`<ul>
+           ${repeat(data.addresses, (addr) => html`<li>${addr.socketAddr} ${protocolInfo(addr)}</li>`)}
+        </ul>`;
+
+        const statusTab = (status, dhtStatus) => html`
+            <div class="row">
+                <div class="col-md-4">
+                    <div class="card">
+                        <div class="card-header">Connections</div>
+                        <div class="card-body">
+                            ${connectionTable(status.connections.pending, 'Pending', 'no pending connections')}
+                            ${connectionTable(status.connections.active, 'Active', 'no active connections')}
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-8">
+                    <div class="card">
+                        <div class="card-header">Nodes</div>
+                        <div class="card-body">
+                            <p class="card-text">Node key: ${dhtStatus.hostNode.key}</p>
+                            <p class="card-text">Others:</p>
+                            <table class="table table-sm">
+                                <tr><td>Key</td><td>Data</td></tr>
+                                ${repeat(dhtStatus.nodes, (node) => html`<tr>
+                                    <td>${node.key}</td>
+                                    <td>${nodeData(node.data)}</td>
+                                </tr>`)}
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        return html`
+            ${navbar}
+            <div class="container-fluid pad-top">
+                ${data.selected === 'status' ? statusTab(data.status, data.dhtStatus) : ''}
+                ${data.selected === 'resolve' ? resolveTab(data.resolveForm) : ''}
+            </div>`
+    };
+
+    function update(data, action) {
+        if (action) {
+            Promise.resolve(action(data)).then(() => render(template(data), document.body))
+        }
+        else {
+            render(template(data), document.body);
+        }
+        return false;
+    }
+
+    const getJson = async (url) => await (await  fetch(url)).json()
+
+    async function getStatus() {
+        let status = await (await fetch("/status")).json();
+        console.log('status:', status);
+        return status;
+    }
+
+    async function updateStatus(data) {
+        data.status = await getStatus();
+        data.dhtStatus = await  getJson("/dht-status");
+    }
+
+    async function do_resolve(data) {
+        data.resolveForm.result = 'pending';
+        render(template(data), document.body);
+        const key = data.resolveForm.key;
+        let resp = await fetch(`/resolve/${key}`);
+        if (resp.status == 200) {
+            data.resolveForm.result = 'ok';
+            data.resolveForm.resultData = await resp.json();
+        }
+        else {
+            data.resolveForm.result = 'error';
+            data.resolveForm.resultData = await resp.text();
+        }
+    }
+
+    update({selected: "status", status: {}, dhtStatus: {}, resolveForm: {key: ''}}, updateStatus);
+
+
+
+</script>
+</body>
+</html>

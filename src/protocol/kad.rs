@@ -199,6 +199,25 @@ where
     }
 }
 
+impl<N, D> Handler<QueryKadStatus> for KadProtocol<N, D>
+where
+    N: KeyLen + Unpin + 'static,
+    <N as ArrayLength<u8>>::ArrayType: Unpin,
+    D: NodeDataExt + 'static,
+{
+    type Result = ActorResponse<Self, KadStatus, ya_net_kad::Error>;
+
+    fn handle(&mut self, msg: QueryKadStatus, ctx: &mut Self::Context) -> Self::Result {
+        let kad = match self.kad.addr() {
+            Ok(v) => v,
+            Err(e) => {
+                return ActorResponse::reply(Err(ya_net_kad::Error::MissingRequest(e.to_string())))
+            }
+        };
+        ActorResponse::r#async(async move { kad.send(msg).await? }.into_actor(self))
+    }
+}
+
 impl<N, D> Handler<ProtocolCmd> for KadProtocol<N, D>
 where
     N: KeyLen + 'static,

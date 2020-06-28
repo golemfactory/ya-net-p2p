@@ -1,5 +1,6 @@
 use crate::key::{Key, KeyLen};
 use crate::node::{Node, NodeData};
+use crate::status::KadStatusNodeInfo;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +27,13 @@ impl<N: KeyLen + 'static, D: NodeData + 'static> Table<N, D> {
             table_size,
             bucket_size,
         }
+    }
+
+    pub(crate) fn status(&self) -> Vec<crate::status::KadStatusNodeInfo> {
+        self.buckets
+            .iter()
+            .flat_map(|b| b.nodes.iter().map(KadStatusNodeInfo::from_node))
+            .collect()
     }
 
     pub fn add(&mut self, node: &Node<N, D>) -> AddNodeStatus {

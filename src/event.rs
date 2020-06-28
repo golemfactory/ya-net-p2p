@@ -109,7 +109,8 @@ where
 
 unsafe impl<Key> Send for DhtCmd<Key> where Key: Send + Clone {}
 
-#[derive(Clone, MessageResponse)]
+#[derive(Clone, MessageResponse, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum DhtResponse<Key>
 where
     Key: Clone + 'static,
@@ -202,3 +203,4 @@ pub enum DisconnectReason {
     Shutdown,
     Other(String),
 }
+
