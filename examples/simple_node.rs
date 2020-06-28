@@ -4,13 +4,13 @@ use actix_web::error::{ErrorBadRequest, ErrorInternalServerError};
 use actix_web::{get, web, App, HttpRequest, HttpServer, Responder};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::convert::{TryFrom, TryInto};
+use std::convert::TryInto;
 use std::env;
 use std::net::SocketAddr;
 use std::time::Duration;
 use structopt::StructOpt;
 use ya_net_kad::key_lengths::U20;
-use ya_net_kad::{KadStatus, Node, QueryKadStatus};
+use ya_net_kad::{Node, QueryKadStatus};
 use ya_net_p2p::crypto::no_crypto;
 use ya_net_p2p::event::{DhtCmd, ServiceCmd};
 use ya_net_p2p::identity::IdentityManager;
@@ -104,7 +104,7 @@ async fn dht_status(dht: web::Data<DhtStatus>) -> impl Responder {
 }
 
 #[get("/")]
-async fn index(req: HttpRequest) -> std::io::Result<NamedFile> {
+async fn index(_req: HttpRequest) -> std::io::Result<NamedFile> {
     actix_files::NamedFile::open("examples/simple_node.html")
 }
 

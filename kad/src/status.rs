@@ -2,7 +2,6 @@ use super::Result;
 use crate::{KeyLen, Node, NodeData};
 use actix::Message;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 #[derive(Message)]
 #[rtype(result = "Result<KadStatus>")]
