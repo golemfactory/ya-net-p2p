@@ -118,7 +118,7 @@ where
         let table = &mut self.table;
 
         self.requests
-            .drain_filter(|_, (_, _, created_at)| now - *created_at < ttl)
+            .drain_filter(|_, (_, _, created_at)| ttl <= now - *created_at)
             .for_each(|(_, (_, key, _))| {
                 table.remove(&key);
             });

@@ -175,7 +175,7 @@ impl ConnectionManager {
     pub fn prune_pending(&mut self, older_than: Duration) {
         let now = Instant::now();
         self.pending
-            .drain_filter(|_, trigger| older_than < now - trigger.created_at)
+            .drain_filter(|_, trigger| now - trigger.created_at <= older_than)
             .for_each(|(addr, mut trigger)| {
                 if trigger.is_pending() {
                     log::debug!(
