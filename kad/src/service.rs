@@ -877,7 +877,7 @@ where
             evt.data
         );
 
-        std::mem::replace(&mut self.node.data, evt.data);
+        let _ = std::mem::replace(&mut self.node.data, evt.data);
         Ok(())
     }
 }

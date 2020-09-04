@@ -321,7 +321,7 @@ impl<N: KeyLen, D: NodeData> Bucket<N, D> {
         let (retain, split) = nodes
             .into_iter()
             .partition(|node| node.distance(key).leading_zeros() == idx);
-        std::mem::replace(&mut self.nodes, retain);
+        let _ = std::mem::replace(&mut self.nodes, retain);
         Bucket::with_nodes(split, self.size)
     }
 }
